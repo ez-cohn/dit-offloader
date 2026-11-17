@@ -1,0 +1,679 @@
+#!/bin/bash
+# dit-offloader - verified camera and audio card offloads for macOS.
+# https://github.com/ez-cohn/dit-offloader
+#
+# Copies every card to all destinations, then re-reads the card and every copy and
+# compares checksums. It never deletes or overwrites a file.
+
+VERSION="0.1.0"
+
+CONFIG="${DIT_OFFLOADER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dit-offloader/config}"
+STATE="${DIT_OFFLOADER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dit-offloader}"
+VOLROOT="${DIT_OFFLOADER_VOLUMES:-/Volumes}"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+TEST_PROJECT="DIT-OFFLOADER-TEST"
+
+# ---------- settings (defaults; the config file overrides them) ----------
+DESTINATIONS=()
+MIN_DESTINATIONS=2
+VIDEO_PATH='{project}/Footage/{date}/CAM{cam}'
+AUDIO_PATH='{project}/Audio/{date}'
+DATE_FORMAT='%Y-%m-%d'
+VIDEO_MODE="full"
+VIDEO_EXTENSIONS="mxf mp4 mov braw r3d crm mts"
+CLIP_FOLDERS=()
+CAMERA_MARKERS=("XDROOT/Clip" "PRIVATE/M4ROOT/CLIP" "CONTENTS/CLIPS001" "CONTENTS/VIDEO" "PRIVATE/AVCHD" "DCIM")
+CAM_SOURCE="filename"
+RENAME_CARD="no"
+AUDIO_ENABLED="yes"
+AUDIO_TAKE_SUFFIX=".TAKE"
+AUDIO_RENAME="no"
+AUDIO_NAME='{date}-{project}-{take}-{track}'
+AUDIO_TAKE_LABEL='Tk%02d'
+AUDIO_ROOMTONE="none"
+AUDIO_TRACKS=""
+AUTO_EJECT="yes"
+HASH_ALGO="md5"
+
+say() { echo "$(date '+%H:%M:%S')  $*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<USAGE
+dit-offloader $VERSION - verified camera and audio card offloads
+
+  dit-offloader init                      create the settings file
+  dit-offloader config                    show the settings in use
+  dit-offloader list                      show mounted drives and recognised cards
+  dit-offloader start <project> [options] offload every recognised card
+  dit-offloader status [--all]            show progress and results
+  dit-offloader eject <job>               eject a card that passed (e.g. A or AUDIO)
+  dit-offloader rehearse [--to <drive>]   practice run with two small fake cards
+
+Options for start:
+  --to <drive>       extra destination for this run (drive name or full path); repeatable
+  --card <name>      offload only this card
+  --cam <id>         camera id for that card, instead of working it out
+  --day YYYY-MM-DD   shoot day, if it is not today
+
+Settings file: $CONFIG
+USAGE
+}
+
+load_config() {
+  [ -f "$CONFIG" ] || die "no settings file yet. Run: dit-offloader init"
+  # shellcheck disable=SC1090
+  . "$CONFIG" || die "could not read $CONFIG"
+  case "$VIDEO_MODE" in full|clips) ;; *) die "VIDEO_MODE must be full or clips" ;; esac
+  case "$CAM_SOURCE" in filename|volume) ;; *) die "CAM_SOURCE must be filename or volume" ;; esac
+  case "$HASH_ALGO" in md5|sha1|sha256) ;; *) die "HASH_ALGO must be md5, sha1 or sha256" ;; esac
+  case "$AUDIO_ROOMTONE" in last|none) ;; *) die "AUDIO_ROOMTONE must be last or none" ;; esac
+}
+
+need_mac() {
+  [ "$(uname)" = Darwin ] || [ -n "$DIT_OFFLOADER_ALLOW_NON_MAC" ] || die "dit-offloader runs on macOS only"
+}
+
+hash_of() {
+  case "$HASH_ALGO" in
+    md5)
+      if command -v md5 >/dev/null 2>&1; then md5 -q "$1" 2>/dev/null
+      else md5sum "$1" 2>/dev/null | cut -d' ' -f1; fi ;;
+    sha1)   shasum -a 1 "$1" 2>/dev/null | cut -d' ' -f1 ;;
+    sha256) shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1 ;;
+  esac
+}
+
+# Format the shoot day ($DAY_ISO, YYYY-MM-DD) with a strftime pattern.
+fmt_day() {
+  date -j -f '%Y-%m-%d' "$DAY_ISO" "+$1" 2>/dev/null || date -d "$DAY_ISO" "+$1"
+}
+
+dest_root() {
+  case "$1" in /*) echo "$1" ;; *) echo "$VOLROOT/$1" ;; esac
+}
+
+# Fill a path template: {project} {date} {cam}
+fill() {
+  local s="$1"
+  s="${s//\{project\}/$PROJECT}"
+  s="${s//\{date\}/$DATE_LABEL}"
+  s="${s//\{cam\}/$2}"
+  echo "$s"
+}
+
+# ---------- recognising cards ----------
+
+take_glob() { echo "[0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9]$AUDIO_TAKE_SUFFIX"; }
+
+is_audio_card() {
+  local d
+  [ "$AUDIO_ENABLED" = yes ] || return 1
+  for d in "$1"/$(take_glob); do [ -d "$d" ] && return 0; done
+  return 1
+}
+
+is_camera_card() {
+  local m
+  for m in "${CAMERA_MARKERS[@]}"; do [ -e "$1/$m" ] && return 0; done
+  return 1
+}
+
+PRUNE=( \( -name .Spotlight-V100 -o -name .fseventsd -o -name .Trashes -o -name .TemporaryItems
+        -o -name .DocumentRevisions-V100 -o -name "System Volume Information" \) -prune )
+
+# Every file on card $1, apart from system folders.
+all_files() {
+  find "$1" "${PRUNE[@]}" -o -type f ! -name .DS_Store -print 2>/dev/null | sort
+}
+
+# The video clips on card $1.
+clip_files() {
+  local src="$1" f ext first=1
+  local roots=() names=()
+  for f in "${CLIP_FOLDERS[@]}"; do [ -d "$src/$f" ] && roots+=("$src/$f"); done
+  [ ${#roots[@]} -gt 0 ] || roots=("$src")
+  for ext in $VIDEO_EXTENSIONS; do
+    [ $first = 1 ] || names+=(-o)
+    first=0
+    names+=(-iname "*.$ext")
+  done
+  find "${roots[@]}" "${PRUNE[@]}" -o -type f \( "${names[@]}" \) ! -name '._*' -print 2>/dev/null | sort
+}
+
+cam_from_filenames() {
+  local ids
+  ids=$(clip_files "$1" | sed 's|.*/||' | cut -c1 | sort -u | tr -d '\n')
+  case "$ids" in
+    [A-Za-z0-9]) echo "$ids" ;;
+    "") die "no video clips found on $1 (looked for: $VIDEO_EXTENSIONS)" ;;
+    *) die "clips on $1 start with different characters ($ids); pass --card and --cam" ;;
+  esac
+}
+
+# New name for audio file $1 in take $2 (YYMMDD_NNN) with take label $3.
+audio_name() {
+  local name="$1" prefix="$2" label="$3" rest stem ext pair track new
+  [ "$AUDIO_RENAME" = yes ] || { echo "$name"; return; }
+  case "$name" in "$prefix"*) ;; *) echo "$name"; return ;; esac
+  rest="${name#"$prefix"}"
+  case "$rest" in
+    *.*) ext=".${rest##*.}"; stem="${rest%.*}" ;;
+    *)   ext=""; stem="$rest" ;;
+  esac
+  stem="${stem#_}"
+  track=""
+  for pair in $AUDIO_TRACKS; do
+    [ "$stem" = "${pair%%=*}" ] && track="${pair#*=}"
+  done
+  [ -n "$track" ] || track="$(printf '%s' "$stem" | tr '_' '-')"
+  new="$AUDIO_NAME"
+  new="${new//\{project\}/$PROJECT}"
+  new="${new//\{date\}/$DATE_LABEL}"
+  new="${new//\{take\}/$label}"
+  new="${new//\{track\}/$track}"
+  while :; do case "$new" in *-|*_) new="${new%?}" ;; *) break ;; esac; done
+  echo "$new$ext"
+}
+
+# The copy plan: one line per file, "<file on card><TAB><path inside the destination>".
+build_plan() {
+  local type="$1" src="$2" f d dn num label i=0 n
+  local dirs=()
+  if [ "$type" = camera ]; then
+    if [ "$VIDEO_MODE" = clips ]; then
+      clip_files "$src" | while IFS= read -r f; do printf '%s\t%s\n' "$f" "$(basename "$f")"; done
+    else
+      all_files "$src" | while IFS= read -r f; do printf '%s\t%s\n' "$f" "${f#"$src"/}"; done
+    fi
+    return
+  fi
+  for d in "$src"/"${REC_DAY}"_[0-9][0-9][0-9]"$AUDIO_TAKE_SUFFIX"; do [ -d "$d" ] && dirs+=("$d"); done
+  n=${#dirs[@]}
+  for d in "${dirs[@]}"; do
+    i=$((i + 1))
+    dn="$(basename "$d")"
+    num="${dn#"${REC_DAY}"_}"; num="${num%"$AUDIO_TAKE_SUFFIX"}"
+    # shellcheck disable=SC2059
+    label="$(printf "$AUDIO_TAKE_LABEL" $((10#$num)))"
+    [ "$AUDIO_ROOMTONE" = last ] && [ "$n" -ge 2 ] && [ "$i" = "$n" ] && label="RoomTone"
+    find "$d" -maxdepth 1 -type f ! -name '.*' | sort | while IFS= read -r f; do
+      printf '%s\t%s/%s\n' "$f" "$dn" "$(audio_name "$(basename "$f")" "${REC_DAY}_$num" "$label")"
+    done
+  done
+}
+
+# ---------- copying and checking ----------
+
+copy_from_card() {   # into folder $1
+  local s r rc=0
+  while IFS=$'\t' read -r s r; do
+    mkdir -p "$(dirname "$1/$r")"
+    cp -pn "$s" "$1/$r" || rc=1
+  done < "$PLAN"
+  return $rc
+}
+
+copy_between() {     # from folder $1 into folder $2
+  local s r rc=0
+  while IFS=$'\t' read -r s r; do
+    mkdir -p "$(dirname "$2/$r")"
+    cp -pn "$1/$r" "$2/$r" || rc=1
+  done < "$PLAN"
+  return $rc
+}
+
+hash_card() {        # checksums of the files on the card, into file $1
+  local s r h
+  while IFS=$'\t' read -r s r; do
+    h="$(hash_of "$s")"; printf '%s  %s\n' "${h:-UNREADABLE}" "$r"
+  done < "$PLAN" | sort > "$1"
+}
+
+hash_dest() {        # checksums of the copies in folder $1, into file $2
+  local s r h
+  while IFS=$'\t' read -r s r; do
+    h="$(hash_of "$1/$r")"; printf '%s  %s\n' "${h:-MISSING}" "$r"
+  done < "$PLAN" | sort > "$2"
+}
+
+free_kb() {
+  local a; a="$(df -Pk "$1" 2>/dev/null | tail -1 | awk '{print $4}')"
+  case "$a" in ''|*[!0-9]*) echo "" ;; *) echo "$a" ;; esac
+}
+
+# ---------- commands ----------
+
+cmd_init() {
+  [ ! -e "$CONFIG" ] || die "$CONFIG already exists; edit it, or delete it to start over"
+  mkdir -p "$(dirname "$CONFIG")"
+  cat > "$CONFIG" <<'TEMPLATE'
+# dit-offloader settings. Lines starting with # are notes.
+
+# Where every offload goes: drive names (as shown in Finder) or full folder paths.
+# Add more for a single run with:  dit-offloader start <project> --to "<drive>"
+DESTINATIONS=("MyBackupDrive")
+
+# Refuse to start with fewer destinations than this.
+MIN_DESTINATIONS=2
+
+# Folder layout inside each destination.
+#   {project} = the name you give to "start"   {date} = shoot day   {cam} = camera id
+VIDEO_PATH='{project}/Footage/{date}/CAM{cam}'
+AUDIO_PATH='{project}/Audio/{date}'
+
+# How {date} is written. %Y-%m-%d gives 2026-11-16, %y%m%d gives 261116.
+DATE_FORMAT='%Y-%m-%d'
+
+# full  = copy the whole card, keeping its folder structure (safest)
+# clips = copy only the video clips, all into one folder
+VIDEO_MODE="full"
+
+# What counts as a video clip.
+VIDEO_EXTENSIONS="mxf mp4 mov braw r3d crm mts"
+
+# Folders on the card that hold the clips. Empty means search the whole card.
+# Example for Sony XDCAM cards: CLIP_FOLDERS=("XDROOT/Clip")
+CLIP_FOLDERS=()
+
+# A drive is treated as a camera card when one of these exists on it.
+CAMERA_MARKERS=("XDROOT/Clip" "PRIVATE/M4ROOT/CLIP" "CONTENTS/CLIPS001" "CONTENTS/VIDEO" "PRIVATE/AVCHD" "DCIM")
+
+# Where the camera id comes from:
+#   filename = the first character of the clip names (A001C001.MXF is camera A)
+#   volume   = the card's drive name
+CAM_SOURCE="filename"
+
+# yes = rename the card's drive to its camera id before copying.
+RENAME_CARD="no"
+
+# Audio cards: recorders that write one folder per take, named YYMMDD_NNN plus a suffix.
+AUDIO_ENABLED="yes"
+AUDIO_TAKE_SUFFIX=".TAKE"
+
+# yes = rename audio files on the copies (the card is never changed).
+#   261116_001_Tr1.WAV becomes AUDIO_NAME with:
+#   {date} {project} {take} = take label   {track} = track name
+AUDIO_RENAME="no"
+AUDIO_NAME='{date}-{project}-{take}-{track}'
+AUDIO_TAKE_LABEL='Tk%02d'
+
+# last = label the last take of the day RoomTone (needs at least two takes). none = off.
+AUDIO_ROOMTONE="none"
+
+# Friendlier track names: <name on the recorder>=<name you want>, separated by spaces.
+# Example: AUDIO_TRACKS="Tr1=Tr1-Boom Tr2=Tr2-Lav TrL_R=TrLR-Mix"
+AUDIO_TRACKS=""
+
+# Eject a card once every copy has been verified.
+AUTO_EJECT="yes"
+
+# Checksum used for verification: md5, sha1 or sha256.
+HASH_ALGO="md5"
+TEMPLATE
+  echo "Created $CONFIG"
+  echo "Open it and set DESTINATIONS, then try: dit-offloader rehearse"
+}
+
+cmd_config() {
+  load_config
+  echo "Settings file: $CONFIG"
+  echo "Logs:          $STATE"
+  grep -v '^[[:space:]]*#' "$CONFIG" | grep -v '^[[:space:]]*$'
+}
+
+cmd_list() {
+  local v name
+  echo "Drives mounted on $(hostname -s):"
+  df -h | awk 'NR==1 || (/\/Volumes\// && !/\/System\/Volumes\//)'
+  [ -f "$CONFIG" ] || return 0
+  load_config
+  echo
+  echo "Recognised cards:"
+  for v in "$VOLROOT"/*; do
+    [ -d "$v" ] && [ ! -L "$v" ] || continue
+    name="$(basename "$v")"
+    if is_audio_card "$v"; then echo "  $name  (audio)"
+    elif is_camera_card "$v"; then echo "  $name  (camera)"; fi
+  done
+}
+
+# Sets ROOTS (destination folders) from DESTINATIONS plus the --to options in EXTRA.
+resolve_destinations() {
+  local d r seen
+  ROOTS=()
+  for d in "${DESTINATIONS[@]}" "${EXTRA[@]}"; do
+    [ -n "$d" ] || continue
+    r="$(dest_root "$d")"
+    [ -d "$r" ] || die "destination $r is not available"
+    for seen in "${ROOTS[@]}"; do [ "$seen" = "$r" ] && die "destination $r is listed twice"; done
+    ROOTS+=("$r")
+  done
+  [ ${#ROOTS[@]} -ge "$MIN_DESTINATIONS" ] ||
+    die "need at least $MIN_DESTINATIONS destinations, have ${#ROOTS[@]}. Add one with --to \"<drive>\""
+}
+
+is_destination() {   # is drive folder $1 a destination, or does it hold one?
+  local r
+  for r in "${ROOTS[@]}"; do
+    case "$r/" in "$1"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+cmd_start() {
+  need_mac; load_config
+  local card="" cam="" v name any=0
+  PROJECT=""; EXTRA=(); DAY_ISO="$(date '+%Y-%m-%d')"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to)   [ -n "$2" ] || die "--to needs a drive name"; EXTRA+=("$2"); shift 2 ;;
+      --card) [ -n "$2" ] || die "--card needs a card name"; card="$2"; shift 2 ;;
+      --cam)  [ -n "$2" ] || die "--cam needs a camera id"; cam="$2"; shift 2 ;;
+      --day)  [ -n "$2" ] || die "--day needs a date"; DAY_ISO="$2"; shift 2 ;;
+      -*)     die "unknown option $1 (see: dit-offloader --help)" ;;
+      *)      [ -z "$PROJECT" ] || die "unexpected extra word \"$1\" (drives go after --to)"; PROJECT="$1"; shift ;;
+    esac
+  done
+  [ -n "$PROJECT" ] || die "usage: dit-offloader start <project> [--to \"<drive>\"]"
+  case "$PROJECT" in */*) die "project name cannot contain a slash" ;; esac
+  [ -z "$cam" ] || [ -n "$card" ] || die "--cam needs --card, so it is clear which card it is for"
+  DATE_LABEL="$(fmt_day "$DATE_FORMAT")" || die "could not understand the day \"$DAY_ISO\" (use YYYY-MM-DD)"
+  resolve_destinations
+  echo "Project: $PROJECT   Day: $DATE_LABEL   Destinations: ${#ROOTS[@]}"
+  for v in "${ROOTS[@]}"; do echo "  $v"; done
+
+  if [ -n "$card" ]; then start_one "$card" "$cam"; return; fi
+  for v in "$VOLROOT"/*; do
+    [ -d "$v" ] && [ ! -L "$v" ] || continue
+    is_destination "$v" && continue
+    if is_audio_card "$v" || is_camera_card "$v"; then
+      any=1
+      echo "--- $(basename "$v")"
+      ( start_one "$(basename "$v")" "" )
+    fi
+  done
+  [ $any = 1 ] || die "no camera or audio card found (see: dit-offloader list)"
+}
+
+start_one() {
+  local card="$1" cam="$2" type job r
+  local src="$VOLROOT/$card"
+  [ -d "$src" ] || die "card $src is not mounted (see: dit-offloader list)"
+  is_destination "$src" && die "$card is a destination, not a card"
+  ls "$src" >/dev/null 2>&1 || die "cannot read $src. If you are connected over SSH, turn on \"Allow full disk access for remote users\" in System Settings > General > Sharing > Remote Login"
+
+  if is_audio_card "$src"; then
+    type=audio; job=AUDIO; cam=""
+    echo "Audio card"
+  else
+    type=camera
+    if [ -z "$cam" ]; then
+      if [ "$CAM_SOURCE" = volume ]; then cam="$card"; else cam="$(cam_from_filenames "$src")" || exit 1; fi
+    fi
+    case "$cam" in ""|*[!A-Za-z0-9_-]*) die "camera id \"$cam\" must be letters, digits, - or _ (pass --cam)" ;; esac
+    job="CAM$cam"
+    echo "Camera card, id $cam"
+  fi
+
+  mkdir -p "$STATE"
+  local pidfile="$STATE/$job.pid"
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    die "an offload for $job is already running (see: dit-offloader status)"
+  fi
+
+  if [ "$type" = camera ] && [ "$RENAME_CARD" = yes ] && [ "$card" != "$cam" ]; then
+    [ ! -e "$VOLROOT/$cam" ] || die "a drive named $cam is already mounted"
+    diskutil rename "$src" "$cam" || die "could not rename the card"
+    sleep 2
+    [ -d "$VOLROOT/$cam" ] || die "card did not reappear as $VOLROOT/$cam after renaming"
+    card="$cam"
+  fi
+
+  local log; log="$STATE/$job-$(date '+%Y%m%d-%H%M%S').log"
+  local keep=""; command -v caffeinate >/dev/null 2>&1 && keep="caffeinate -i"
+  local rootlist=""; for r in "${ROOTS[@]}"; do rootlist="$rootlist$r"$'\n'; done
+  # shellcheck disable=SC2086
+  DIT_RUN_PROJECT="$PROJECT" DIT_RUN_DAY="$DAY_ISO" DIT_RUN_ROOTS="$rootlist" DIT_RUN_CAM="$cam" \
+    nohup $keep "$SELF" _run "$job" "$type" "$card" > "$log" 2>&1 < /dev/null &
+  echo $! > "$pidfile"
+  echo "Started $job in the background. It keeps running if you disconnect."
+}
+
+cmd_run() {
+  load_config
+  local job="$1" type="$2" src="$VOLROOT/$3" sub r i
+  PROJECT="$DIT_RUN_PROJECT"; DAY_ISO="$DIT_RUN_DAY"
+  DATE_LABEL="$(fmt_day "$DATE_FORMAT")"; REC_DAY="$(fmt_day '%y%m%d')"
+  ROOTS=()
+  while IFS= read -r r; do [ -n "$r" ] && ROOTS+=("$r"); done <<< "$DIT_RUN_ROOTS"
+  if [ "$type" = camera ]; then sub="$(fill "$VIDEO_PATH" "$DIT_RUN_CAM")"; else sub="$(fill "$AUDIO_PATH" "")"; fi
+  local dests=()
+  for r in "${ROOTS[@]}"; do dests+=("$r/$sub"); done
+  local n=${#dests[@]}
+  local work; work="$STATE/work-$job-$(date '+%Y%m%d-%H%M%S')"
+  mkdir -p "$work"
+  PLAN="$STATE/$job.plan"
+  { echo "$src"; for r in "${dests[@]}"; do echo "$r"; done; } > "$STATE/$job.paths"
+
+  say "$job offload starting (dit-offloader $VERSION)"
+  say "  card:          $src"
+  i=0; for r in "${dests[@]}"; do i=$((i + 1)); say "  destination $i: $r"; done
+
+  build_plan "$type" "$src" > "$PLAN"
+  local count; count=$(wc -l < "$PLAN" | tr -d ' ')
+  if [ "$count" = 0 ]; then
+    if [ "$type" = audio ]; then
+      say "RESULT: FAIL - no takes dated $REC_DAY on the audio card. Takes found:"
+      # shellcheck disable=SC2010
+      ls "$src" | grep -F "$AUDIO_TAKE_SUFFIX" | head -20
+    else
+      say "RESULT: FAIL - nothing to copy was found on the card"
+    fi
+    exit 1
+  fi
+  local dups; dups="$(cut -f2 "$PLAN" | sort | uniq -d)"
+  if [ -n "$dups" ]; then
+    say "RESULT: FAIL - these names occur more than once on the card, nothing copied:"
+    echo "$dups" | head -20
+    exit 1
+  fi
+
+  local kb=0 k s d free
+  while IFS=$'\t' read -r s r; do
+    k="$(du -k "$s" 2>/dev/null | cut -f1)"; kb=$((kb + ${k:-0}))
+  done < "$PLAN"
+  say "  files to copy: $count ($((kb / 1024)) MB)"
+  say "  names at the destination:"
+  cut -f2 "$PLAN" | sed 's/^/              /' | head -60
+  [ "$count" -le 60 ] || echo "              ... and $((count - 60)) more"
+
+  for d in "${dests[@]}"; do
+    mkdir -p "$d" || { say "RESULT: FAIL - could not create $d"; exit 1; }
+    free="$(free_kb "$d")"
+    if [ -n "$free" ] && [ "$free" -lt "$kb" ]; then
+      say "RESULT: FAIL - not enough free space on $d, nothing copied"; exit 1
+    fi
+  done
+
+  say "Step 1/3: copying the card to destination 1"
+  copy_from_card "${dests[0]}" || say "  note: cp reported a problem; verification will show if it matters"
+
+  say "Step 2/3: copying destination 1 to the other destinations, and checksumming the card"
+  local pids=()
+  i=1
+  while [ $i -lt "$n" ]; do
+    ( copy_between "${dests[0]}" "${dests[$i]}" ||
+        echo "$(date '+%H:%M:%S')    note: cp to destination $((i + 1)) reported a problem" ) &
+    pids+=($!)
+    i=$((i + 1))
+  done
+  hash_card "$work/card.$HASH_ALGO"
+  for k in "${pids[@]}"; do wait "$k"; done
+
+  say "Step 3/3: checksumming every copy"
+  pids=()
+  i=0
+  while [ $i -lt "$n" ]; do
+    hash_dest "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" &
+    pids+=($!)
+    i=$((i + 1))
+  done
+  for k in "${pids[@]}"; do wait "$k"; done
+
+  local ok=1
+  if grep -q '^UNREADABLE' "$work/card.$HASH_ALGO"; then ok=0; say "  some files on the card could not be read"; fi
+  i=1
+  while [ $i -le "$n" ]; do
+    if ! diff "$work/card.$HASH_ALGO" "$work/dest$i.$HASH_ALGO" > "$work/diff$i.txt"; then
+      ok=0; say "  destination $i does NOT match the card:"; head -20 "$work/diff$i.txt"
+    fi
+    i=$((i + 1))
+  done
+
+  if [ $ok != 1 ]; then
+    say "RESULT: FAIL - $job: do NOT erase this card. Details in $work"
+    exit 1
+  fi
+  say "RESULT: PASS - $job: all $count files match on $n destinations."
+  say "  checksum list: $work/card.$HASH_ALGO"
+  if [ "$AUTO_EJECT" = yes ]; then
+    if diskutil eject "$src" >/dev/null 2>&1; then say "Card ejected. Safe to remove."
+    else say "Could not eject the card automatically. Run: dit-offloader eject $job"; fi
+  fi
+}
+
+running_jobs() {
+  local p n=0
+  for p in "$STATE"/*.pid; do
+    [ -f "$p" ] && kill -0 "$(cat "$p")" 2>/dev/null && n=$((n + 1))
+  done
+  echo $n
+}
+
+cmd_status() {
+  local found=0 p job state log total s r d c i line
+  local all="no"; [ "$1" = "--all" ] && all="yes"
+  for p in "$STATE"/*.pid; do
+    [ -f "$p" ] || continue
+    if [ "$all" = no ] && [ -z "$(find "$p" -mmin -1440 2>/dev/null)" ]; then continue; fi
+    found=1
+    job="$(basename "$p" .pid)"
+    if kill -0 "$(cat "$p")" 2>/dev/null; then state="RUNNING"; else state="finished"; fi
+    echo "===== $job: $state ====="
+    if [ "$state" = RUNNING ] && [ -f "$STATE/$job.paths" ] && [ -f "$STATE/$job.plan" ]; then
+      total=$(wc -l < "$STATE/$job.plan" | tr -d ' ')
+      i=0
+      while IFS= read -r d; do
+        if [ $i -gt 0 ]; then
+          c=0
+          while IFS=$'\t' read -r s r; do [ -e "$d/$r" ] && c=$((c + 1)); done < "$STATE/$job.plan"
+          line="files arrived at destination $i: $c/$total ($(du -sh "$d" 2>/dev/null | cut -f1))"
+          echo "$line"
+        fi
+        i=$((i + 1))
+      done < "$STATE/$job.paths"
+    fi
+    # shellcheck disable=SC2012
+    log="$(ls -t "$STATE/$job"-*.log 2>/dev/null | head -1)"
+    [ -n "$log" ] && grep -v '^              ' "$log" | tail -8
+    echo
+  done
+  [ $found = 1 ] || echo "No offloads in the last 24 hours. (Older ones: dit-offloader status --all)"
+}
+
+cmd_eject() {
+  need_mac
+  local job log src
+  case "$1" in
+    "") die "usage: dit-offloader eject <job>   (for example A or AUDIO)" ;;
+    AUDIO|audio) job="AUDIO" ;;
+    CAM*) job="$1" ;;
+    *) job="CAM$1" ;;
+  esac
+  # shellcheck disable=SC2012
+  log="$(ls -t "$STATE/$job"-*.log 2>/dev/null | head -1)"
+  if [ -z "$log" ] || ! grep -q "RESULT: PASS" "$log"; then
+    die "$job has not passed verification; not ejecting"
+  fi
+  read -r src < "$STATE/$job.paths"
+  diskutil eject "$src"
+}
+
+make_fake_card() {
+  local name="$1" img="/tmp/dit-offloader-fake-$1-$$.dmg" try
+  [ ! -e "$VOLROOT/$name" ] || die "a drive named $name is already mounted; eject it first"
+  hdiutil create -ov -size 50m -fs ExFAT -volname "$name" "$img" >/dev/null || die "could not create $img"
+  for try in 1 2 3; do
+    hdiutil attach "$img" >/dev/null && [ -d "$VOLROOT/$name" ] && return 0
+    echo "  (mount attempt $try failed, retrying)"; sleep 3
+  done
+  die "could not mount fake card $name"
+}
+
+# Practice run: builds a fake camera card and a fake audio card and offloads only those.
+cmd_rehearse() {
+  need_mac; load_config
+  local cam aud n t ext folder rec waited=0 args=() d
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) [ -n "$2" ] || die "--to needs a drive name"; args+=(--to "$2"); shift 2 ;;
+      *) die "usage: dit-offloader rehearse [--to \"<drive>\"]" ;;
+    esac
+  done
+  command -v hdiutil >/dev/null 2>&1 || die "rehearse needs macOS"
+  [ "$RENAME_CARD" != yes ] || [ ! -e "$VOLROOT/Z" ] || die "a drive named Z is already mounted; eject it first"
+  rec="$(date '+%y%m%d')"
+  # shellcheck disable=SC2086
+  set -- $VIDEO_EXTENSIONS; ext="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  folder="${CLIP_FOLDERS[0]:-CLIPS}"
+
+  make_fake_card FAKECAM
+  cam="$VOLROOT/FAKECAM"
+  mkdir -p "$cam/$folder" "$cam/OTHER"
+  for n in 001 002; do
+    head -c 300000 /bin/ls > "$cam/$folder/Z001C${n}_TEST.$ext"
+    echo "<xml/>" > "$cam/$folder/Z001C${n}_TEST.XML"
+  done
+  echo "index" > "$cam/OTHER/INDEX.BIN"
+  echo "Fake camera card created: FAKECAM (clips named Z...)"
+  ( cmd_start "$TEST_PROJECT" "${args[@]}" --card FAKECAM ) || exit 1
+
+  if [ "$AUDIO_ENABLED" = yes ]; then
+    make_fake_card FAKEAUDIO
+    aud="$VOLROOT/FAKEAUDIO"
+    for n in 001 002 003; do
+      mkdir -p "$aud/${rec}_$n$AUDIO_TAKE_SUFFIX"
+      for t in Tr1 Tr2 TrL_R; do echo "audio $n $t" > "$aud/${rec}_$n$AUDIO_TAKE_SUFFIX/${rec}_${n}_$t.WAV"; done
+    done
+    mkdir -p "$aud/250101_001$AUDIO_TAKE_SUFFIX"; echo old > "$aud/250101_001$AUDIO_TAKE_SUFFIX/250101_001_Tr1.WAV"
+    echo "Fake audio card created: FAKEAUDIO (3 takes today, 1 old take)"
+    ( cmd_start "$TEST_PROJECT" "${args[@]}" --card FAKEAUDIO ) || exit 1
+  fi
+
+  while [ "$(running_jobs)" -gt 0 ] && [ $waited -lt 90 ]; do sleep 2; waited=$((waited + 2)); done
+  sleep 1
+  echo; cmd_status
+  EXTRA=(); n=0
+  while [ $n -lt ${#args[@]} ]; do EXTRA+=("${args[$((n + 1))]}"); n=$((n + 2)); done
+  resolve_destinations
+  echo "===== what landed on ${ROOTS[0]} ====="
+  ( cd "${ROOTS[0]}" && find "$TEST_PROJECT"* -type f 2>/dev/null | sort )
+  echo
+  echo "Nothing is deleted automatically. When you are done looking, remove:"
+  for d in "${ROOTS[@]}"; do echo "  $d/$TEST_PROJECT*"; done
+  echo "  /tmp/dit-offloader-fake-*.dmg"
+}
+
+case "$1" in
+  init)       cmd_init ;;
+  config)     cmd_config ;;
+  list)       cmd_list ;;
+  start)      shift; cmd_start "$@" ;;
+  _run)       cmd_run "$2" "$3" "$4" ;;
+  status)     cmd_status "$2" ;;
+  eject)      cmd_eject "$2" ;;
+  rehearse)   shift; cmd_rehearse "$@" ;;
+  --version|-v|version) echo "dit-offloader $VERSION" ;;
+  *)          usage ;;
+esac
