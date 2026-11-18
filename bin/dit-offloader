@@ -5,7 +5,7 @@
 # Copies every card to all destinations, then re-reads the card and every copy and
 # compares checksums. It never deletes or overwrites a file.
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 CONFIG="${DIT_OFFLOADER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dit-offloader/config}"
 STATE="${DIT_OFFLOADER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dit-offloader}"
@@ -55,6 +55,7 @@ Options for start:
   --card <name>      offload only this card
   --cam <id>         camera id for that card, instead of working it out
   --day YYYY-MM-DD   shoot day, if it is not today
+  --overnight        also take audio takes dated the day after the shoot day
 
 Settings file: $CONFIG
 USAGE
@@ -66,7 +67,11 @@ load_config() {
   . "$CONFIG" || die "could not read $CONFIG"
   case "$VIDEO_MODE" in full|clips) ;; *) die "VIDEO_MODE must be full or clips" ;; esac
   case "$CAM_SOURCE" in filename|volume) ;; *) die "CAM_SOURCE must be filename or volume" ;; esac
-  case "$HASH_ALGO" in md5|sha1|sha256) ;; *) die "HASH_ALGO must be md5, sha1 or sha256" ;; esac
+  case "$HASH_ALGO" in
+    md5|sha1|sha256) ;;
+    xxh64|xxh128) command -v xxhsum >/dev/null 2>&1 || die "HASH_ALGO=$HASH_ALGO needs xxhsum. Run: brew install xxhash" ;;
+    *) die "HASH_ALGO must be md5, sha1, sha256, xxh64 or xxh128" ;;
+  esac
   case "$AUDIO_ROOMTONE" in last|none) ;; *) die "AUDIO_ROOMTONE must be last or none" ;; esac
 }
 
@@ -81,6 +86,8 @@ hash_of() {
       else md5sum "$1" 2>/dev/null | cut -d' ' -f1; fi ;;
     sha1)   shasum -a 1 "$1" 2>/dev/null | cut -d' ' -f1 ;;
     sha256) shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1 ;;
+    xxh64)  [ -r "$1" ] && xxhsum -H1 < "$1" 2>/dev/null | cut -d' ' -f1 ;;
+    xxh128) [ -r "$1" ] && xxhsum -H2 < "$1" 2>/dev/null | cut -d' ' -f1 ;;
   esac
 }
 
@@ -188,17 +195,21 @@ build_plan() {
     fi
     return
   fi
-  for d in "$src"/"${REC_DAY}"_[0-9][0-9][0-9]"$AUDIO_TAKE_SUFFIX"; do [ -d "$d" ] && dirs+=("$d"); done
+  local day
+  for day in $REC_DAYS; do
+    for d in "$src"/"${day}"_[0-9][0-9][0-9]"$AUDIO_TAKE_SUFFIX"; do [ -d "$d" ] && dirs+=("$d"); done
+  done
   n=${#dirs[@]}
   for d in "${dirs[@]}"; do
     i=$((i + 1))
     dn="$(basename "$d")"
-    num="${dn#"${REC_DAY}"_}"; num="${num%"$AUDIO_TAKE_SUFFIX"}"
+    day="${dn%%_*}"
+    num="${dn#"${day}"_}"; num="${num%"$AUDIO_TAKE_SUFFIX"}"
     # shellcheck disable=SC2059
     label="$(printf "$AUDIO_TAKE_LABEL" $((10#$num)))"
     [ "$AUDIO_ROOMTONE" = last ] && [ "$n" -ge 2 ] && [ "$i" = "$n" ] && label="RoomTone"
     find "$d" -maxdepth 1 -type f ! -name '.*' | sort | while IFS= read -r f; do
-      printf '%s\t%s/%s\n' "$f" "$dn" "$(audio_name "$(basename "$f")" "${REC_DAY}_$num" "$label")"
+      printf '%s\t%s/%s\n' "$f" "$dn" "$(audio_name "$(basename "$f")" "${day}_$num" "$label")"
     done
   done
 }
@@ -241,6 +252,45 @@ free_kb() {
   local a; a="$(df -Pk "$1" 2>/dev/null | tail -1 | awk '{print $4}')"
   case "$a" in ''|*[!0-9]*) echo "" ;; *) echo "$a" ;; esac
 }
+
+mount_of() {         # mount point of the drive holding $1
+  df -Pk "$1" 2>/dev/null | tail -1 | sed -E 's/^([^ ]+ +){5}//'
+}
+
+# Is the offload for job $1 running? Checks the command too, in case the pid was reused.
+job_alive() {
+  local pid
+  [ -f "$STATE/$1.pid" ] || return 1
+  pid="$(cat "$STATE/$1.pid")"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  ps -p "$pid" -o command= 2>/dev/null | grep -q -- "_run $1 "
+}
+
+# Space job $1 still needs, one line per destination: "<mount point><TAB><KB>".
+space_needed() {
+  local d k s r have total
+  [ -f "$STATE/$1.sizes" ] && [ -f "$STATE/$1.paths" ] || return 0
+  tail -n +2 "$STATE/$1.paths" | while IFS= read -r d; do
+    total=0
+    while IFS=$'\t' read -r k s r; do
+      have=0; [ -e "$d/$r" ] && have="$(du -k "$d/$r" 2>/dev/null | cut -f1)"
+      [ "$k" -gt "${have:-0}" ] && total=$((total + k - ${have:-0}))
+    done < <(paste "$STATE/$1.sizes" "$STATE/$1.plan")
+    printf '%s\t%s\n' "$(mount_of "$d")" "$total"
+  done
+}
+
+# Offloads that start together check free space one at a time.
+lock_space() {
+  local i=0
+  until mkdir "$STATE/space.lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ $i -lt 120 ] || { say "  note: another offload held the free space check for 2 minutes; going ahead"; return 0; }
+    sleep 1
+  done
+}
+
+unlock_space() { rmdir "$STATE/space.lock" 2>/dev/null; }
 
 # ---------- commands ----------
 
@@ -308,7 +358,8 @@ AUDIO_TRACKS=""
 # Eject a card once every copy has been verified.
 AUTO_EJECT="yes"
 
-# Checksum used for verification: md5, sha1 or sha256.
+# Checksum used for verification: md5, sha1, sha256, xxh64 or xxh128.
+# xxh64 and xxh128 are much faster on large cards and need xxhsum (brew install xxhash).
 HASH_ALGO="md5"
 TEMPLATE
   echo "Created $CONFIG"
@@ -363,14 +414,15 @@ is_destination() {   # is drive folder $1 a destination, or does it hold one?
 
 cmd_start() {
   need_mac; load_config
-  local card="" cam="" v name any=0
-  PROJECT=""; EXTRA=(); DAY_ISO="$(date '+%Y-%m-%d')"
+  local card="" cam="" v name any=0 failed=0
+  PROJECT=""; EXTRA=(); DAY_ISO="$(date '+%Y-%m-%d')"; OVERNIGHT=no
   while [ $# -gt 0 ]; do
     case "$1" in
       --to)   [ -n "$2" ] || die "--to needs a drive name"; EXTRA+=("$2"); shift 2 ;;
       --card) [ -n "$2" ] || die "--card needs a card name"; card="$2"; shift 2 ;;
       --cam)  [ -n "$2" ] || die "--cam needs a camera id"; cam="$2"; shift 2 ;;
       --day)  [ -n "$2" ] || die "--day needs a date"; DAY_ISO="$2"; shift 2 ;;
+      --overnight) OVERNIGHT=yes; shift ;;
       -*)     die "unknown option $1 (see: dit-offloader --help)" ;;
       *)      [ -z "$PROJECT" ] || die "unexpected extra word \"$1\" (drives go after --to)"; PROJECT="$1"; shift ;;
     esac
@@ -390,10 +442,11 @@ cmd_start() {
     if is_audio_card "$v" || is_camera_card "$v"; then
       any=1
       echo "--- $(basename "$v")"
-      ( start_one "$(basename "$v")" "" )
+      ( start_one "$(basename "$v")" "" ) || failed=$((failed + 1))
     fi
   done
   [ $any = 1 ] || die "no camera or audio card found (see: dit-offloader list)"
+  [ $failed = 0 ] || die "$failed card(s) did not start; see the messages above"
 }
 
 start_one() {
@@ -418,7 +471,7 @@ start_one() {
 
   mkdir -p "$STATE"
   local pidfile="$STATE/$job.pid"
-  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+  if job_alive "$job"; then
     die "an offload for $job is already running (see: dit-offloader status)"
   fi
 
@@ -435,6 +488,7 @@ start_one() {
   local rootlist=""; for r in "${ROOTS[@]}"; do rootlist="$rootlist$r"$'\n'; done
   # shellcheck disable=SC2086
   DIT_RUN_PROJECT="$PROJECT" DIT_RUN_DAY="$DAY_ISO" DIT_RUN_ROOTS="$rootlist" DIT_RUN_CAM="$cam" \
+    DIT_RUN_OVERNIGHT="$OVERNIGHT" \
     nohup $keep "$SELF" _run "$job" "$type" "$card" > "$log" 2>&1 < /dev/null &
   echo $! > "$pidfile"
   echo "Started $job in the background. It keeps running if you disconnect."
@@ -444,16 +498,21 @@ cmd_run() {
   load_config
   local job="$1" type="$2" src="$VOLROOT/$3" sub r i
   PROJECT="$DIT_RUN_PROJECT"; DAY_ISO="$DIT_RUN_DAY"
-  DATE_LABEL="$(fmt_day "$DATE_FORMAT")"; REC_DAY="$(fmt_day '%y%m%d')"
+  DATE_LABEL="$(fmt_day "$DATE_FORMAT")"; REC_DAYS="$(fmt_day '%y%m%d')"
+  if [ "$DIT_RUN_OVERNIGHT" = yes ]; then
+    REC_DAYS="$REC_DAYS $(date -j -v+1d -f '%Y-%m-%d' "$DAY_ISO" '+%y%m%d' 2>/dev/null || date -d "$DAY_ISO + 1 day" '+%y%m%d')"
+  fi
   ROOTS=()
   while IFS= read -r r; do [ -n "$r" ] && ROOTS+=("$r"); done <<< "$DIT_RUN_ROOTS"
   if [ "$type" = camera ]; then sub="$(fill "$VIDEO_PATH" "$DIT_RUN_CAM")"; else sub="$(fill "$AUDIO_PATH" "")"; fi
   local dests=()
   for r in "${ROOTS[@]}"; do dests+=("$r/$sub"); done
   local n=${#dests[@]}
-  local work; work="$STATE/work-$job-$(date '+%Y%m%d-%H%M%S')"
+  local stamp; stamp="$(date '+%Y%m%d-%H%M%S')"
+  local work="$STATE/work-$job-$stamp"
   mkdir -p "$work"
   PLAN="$STATE/$job.plan"
+  rm -f "$STATE/$job.sizes"
   { echo "$src"; for r in "${dests[@]}"; do echo "$r"; done; } > "$STATE/$job.paths"
 
   say "$job offload starting (dit-offloader $VERSION)"
@@ -464,7 +523,7 @@ cmd_run() {
   local count; count=$(wc -l < "$PLAN" | tr -d ' ')
   if [ "$count" = 0 ]; then
     if [ "$type" = audio ]; then
-      say "RESULT: FAIL - no takes dated $REC_DAY on the audio card. Takes found:"
+      say "RESULT: FAIL - no takes dated ${REC_DAYS// / or } on the audio card. Takes found:"
       # shellcheck disable=SC2010
       ls "$src" | grep -F "$AUDIO_TAKE_SUFFIX" | head -20
     else
@@ -482,7 +541,8 @@ cmd_run() {
   local kb=0 k s d free
   while IFS=$'\t' read -r s r; do
     k="$(du -k "$s" 2>/dev/null | cut -f1)"; kb=$((kb + ${k:-0}))
-  done < "$PLAN"
+    echo "${k:-0}"
+  done < "$PLAN" > "$work/sizes"
   say "  files to copy: $count ($((kb / 1024)) MB)"
   say "  names at the destination:"
   cut -f2 "$PLAN" | sed 's/^/              /' | head -60
@@ -490,11 +550,51 @@ cmd_run() {
 
   for d in "${dests[@]}"; do
     mkdir -p "$d" || { say "RESULT: FAIL - could not create $d"; exit 1; }
-    free="$(free_kb "$d")"
-    if [ -n "$free" ] && [ "$free" -lt "$kb" ]; then
-      say "RESULT: FAIL - not enough free space on $d, nothing copied"; exit 1
-    fi
   done
+
+  # Files already at a destination (an earlier or interrupted run): keep identical ones,
+  # stop if any differ. Nothing is ever overwritten.
+  local h1 h2 same=0
+  : > "$work/existing.txt"
+  while IFS=$'\t' read -r s r; do
+    h1=""
+    for d in "${dests[@]}"; do
+      [ -e "$d/$r" ] || continue
+      [ -n "$h1" ] || h1="$(hash_of "$s")"
+      h2="$(hash_of "$d/$r")"
+      if [ -n "$h1" ] && [ "$h1" = "$h2" ]; then same=$((same + 1)); else echo "$d/$r" >> "$work/existing.txt"; fi
+    done
+  done < "$PLAN"
+  if [ -s "$work/existing.txt" ]; then
+    say "RESULT: FAIL - $job: these files are already at a destination and differ from the card, nothing copied:"
+    head -20 "$work/existing.txt"
+    say "  They may be left from an interrupted offload or come from another card."
+    say "  Move them aside (dit-offloader never deletes or overwrites), then start again."
+    exit 1
+  fi
+  [ $same = 0 ] || say "  $same copies are already at a destination and match the card; they are kept"
+
+  # Free space, counting what other running offloads still need on the same drives.
+  local m want mine
+  lock_space
+  mv "$work/sizes" "$STATE/$job.sizes"
+  space_needed "$job" > "$work/space-mine.txt"
+  for k in "$STATE"/*.pid; do
+    s="$(basename "$k" .pid)"
+    [ "$s" != "$job" ] && job_alive "$s" && space_needed "$s"
+  done > "$work/space-others.txt"
+  while IFS=$'\t' read -r m want; do
+    mine="$(awk -F'\t' -v m="$m" '$1 == m { n += $2 } END { print n + 0 }' "$work/space-mine.txt")"
+    [ "$mine" -gt 0 ] || continue
+    free="$(free_kb "$m")"
+    if [ -n "$free" ] && [ "$free" -lt "$want" ]; then
+      say "RESULT: FAIL - not enough free space on $m, nothing copied"
+      say "  needed: $((want / 1024)) MB (this offload $((mine / 1024)) MB, plus running offloads)   free: $((free / 1024)) MB"
+      rm -f "$STATE/$job.sizes"; unlock_space; exit 1
+    fi
+  done < <(cat "$work/space-mine.txt" "$work/space-others.txt" |
+           awk -F'\t' '{ n[$1] += $2 } END { for (m in n) print m "\t" n[m] }')
+  unlock_space
 
   say "Step 1/3: copying the card to destination 1"
   copy_from_card "${dests[0]}" || say "  note: cp reported a problem; verification will show if it matters"
@@ -537,6 +637,13 @@ cmd_run() {
   fi
   say "RESULT: PASS - $job: all $count files match on $n destinations."
   say "  checksum list: $work/card.$HASH_ALGO"
+  for d in "${dests[@]}"; do
+    if cp -n "$work/card.$HASH_ALGO" "$d/dit-offloader_${job}_$stamp.$HASH_ALGO" 2>/dev/null; then
+      say "  checksum list saved: $d/dit-offloader_${job}_$stamp.$HASH_ALGO"
+    else
+      say "  note: could not save the checksum list in $d"
+    fi
+  done
   if [ "$AUTO_EJECT" = yes ]; then
     if diskutil eject "$src" >/dev/null 2>&1; then say "Card ejected. Safe to remove."
     else say "Could not eject the card automatically. Run: dit-offloader eject $job"; fi
@@ -546,7 +653,7 @@ cmd_run() {
 running_jobs() {
   local p n=0
   for p in "$STATE"/*.pid; do
-    [ -f "$p" ] && kill -0 "$(cat "$p")" 2>/dev/null && n=$((n + 1))
+    [ -f "$p" ] && job_alive "$(basename "$p" .pid)" && n=$((n + 1))
   done
   echo $n
 }
@@ -559,7 +666,11 @@ cmd_status() {
     if [ "$all" = no ] && [ -z "$(find "$p" -mmin -1440 2>/dev/null)" ]; then continue; fi
     found=1
     job="$(basename "$p" .pid)"
-    if kill -0 "$(cat "$p")" 2>/dev/null; then state="RUNNING"; else state="finished"; fi
+    # shellcheck disable=SC2012
+    log="$(ls -t "$STATE/$job"-*.log 2>/dev/null | head -1)"
+    if job_alive "$job"; then state="RUNNING"
+    elif [ -n "$log" ] && grep -q "RESULT:" "$log"; then state="finished"
+    else state="INTERRUPTED"; fi
     echo "===== $job: $state ====="
     if [ "$state" = RUNNING ] && [ -f "$STATE/$job.paths" ] && [ -f "$STATE/$job.plan" ]; then
       total=$(wc -l < "$STATE/$job.plan" | tr -d ' ')
@@ -574,9 +685,9 @@ cmd_status() {
         i=$((i + 1))
       done < "$STATE/$job.paths"
     fi
-    # shellcheck disable=SC2012
-    log="$(ls -t "$STATE/$job"-*.log 2>/dev/null | head -1)"
     [ -n "$log" ] && grep -v '^              ' "$log" | tail -8
+    [ "$state" != INTERRUPTED ] ||
+      echo "RESULT: INTERRUPTED - $job stopped before it finished. Do NOT erase this card; start it again."
     echo
   done
   [ $found = 1 ] || echo "No offloads in the last 24 hours. (Older ones: dit-offloader status --all)"
@@ -611,10 +722,24 @@ make_fake_card() {
   die "could not mount fake card $name"
 }
 
+wait_for_jobs() {    # up to $1 seconds
+  local waited=0
+  while [ "$(running_jobs)" -gt 0 ] && [ $waited -lt "$1" ]; do sleep 2; waited=$((waited + 2)); done
+}
+
+# Detach fake cards that are still mounted, after their offloads have stopped.
+detach_fakes() {
+  local name
+  wait_for_jobs 90
+  for name in FAKECAM FAKEAUDIO "${FAKE_Z:-}"; do
+    [ -n "$name" ] && [ -d "$VOLROOT/$name" ] && hdiutil detach "$VOLROOT/$name" -quiet >/dev/null 2>&1
+  done
+}
+
 # Practice run: builds a fake camera card and a fake audio card and offloads only those.
 cmd_rehearse() {
   need_mac; load_config
-  local cam aud n t ext folder rec waited=0 args=() d
+  local cam aud n t ext folder rec args=() d
   while [ $# -gt 0 ]; do
     case "$1" in
       --to) [ -n "$2" ] || die "--to needs a drive name"; args+=(--to "$2"); shift 2 ;;
@@ -623,6 +748,8 @@ cmd_rehearse() {
   done
   command -v hdiutil >/dev/null 2>&1 || die "rehearse needs macOS"
   [ "$RENAME_CARD" != yes ] || [ ! -e "$VOLROOT/Z" ] || die "a drive named Z is already mounted; eject it first"
+  [ "$RENAME_CARD" != yes ] || FAKE_Z=Z
+  trap detach_fakes EXIT
   rec="$(date '+%y%m%d')"
   # shellcheck disable=SC2086
   set -- $VIDEO_EXTENSIONS; ext="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
@@ -651,7 +778,7 @@ cmd_rehearse() {
     ( cmd_start "$TEST_PROJECT" "${args[@]}" --card FAKEAUDIO ) || exit 1
   fi
 
-  while [ "$(running_jobs)" -gt 0 ] && [ $waited -lt 90 ]; do sleep 2; waited=$((waited + 2)); done
+  wait_for_jobs 90
   sleep 1
   echo; cmd_status
   EXTRA=(); n=0

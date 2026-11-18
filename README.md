@@ -17,37 +17,40 @@ slow connection and keeps going if you disconnect.
   or from the card's drive name.
 - Copies into a folder layout you define, such as `Project/Footage/2026-11-16/CAMA/`.
 - Copies the whole card, or only the video clips into one flat folder.
-- Verifies every file on every destination with MD5, SHA-1 or SHA-256.
+- Verifies every file on every destination with MD5, SHA-1, SHA-256, xxHash64 or xxHash128.
+- Saves the checksum list next to the copies on every destination, so the proof travels
+  with the footage.
 - Never deletes or overwrites a file. If a file with the same name already exists
-  and differs, the offload fails instead of replacing it.
+  and differs, the offload stops before copying anything.
+- Checks free space before copying, counting what other running offloads still need.
 - Ejects a card once it has passed.
 - Optionally renames audio files, for example
   `261116_001_Tr1.WAV` to `261116-Project-Tk01-Tr1-Boom.WAV`.
 
 ## Install
 
-```
+```sh
 brew install ez-cohn/tap/dit-offloader
 ```
 
-Requires macOS. No other dependencies.
+Requires macOS. Homebrew also installs `xxhash`, used when `HASH_ALGO` is `xxh64` or `xxh128`.
 
 ## Quick start
 
-```
+```sh
 dit-offloader init        # creates ~/.config/dit-offloader/config
 ```
 
 Open that file and set `DESTINATIONS` to your drive names. Then practice with two
 small fake cards, which touches no real card:
 
-```
+```sh
 dit-offloader rehearse --to "SecondDrive"
 ```
 
 For a real shoot, plug in the cards and run:
 
-```
+```sh
 dit-offloader start MyProject --to "SecondDrive"
 dit-offloader status
 ```
@@ -72,6 +75,7 @@ Options for `start`:
 | `--card <name>` | Offload only this card |
 | `--cam <id>` | Camera id for that card, instead of working it out |
 | `--day YYYY-MM-DD` | Shoot day, if it is not today |
+| `--overnight` | Also take audio takes dated the day after the shoot day, for shoots past midnight |
 
 ## Settings
 
@@ -93,7 +97,7 @@ Options for `start`:
 | `AUDIO_RENAME` | `no` | Rename audio files on the copies |
 | `AUDIO_ROOMTONE` | `none` | `last` labels the day's last take RoomTone |
 | `AUTO_EJECT` | `yes` | Eject a card after it passes |
-| `HASH_ALGO` | `md5` | `md5`, `sha1` or `sha256` |
+| `HASH_ALGO` | `md5` | `md5`, `sha1`, `sha256`, `xxh64` or `xxh128` (the xxHash ones are much faster) |
 
 See [examples](examples) for a complete settings file.
 
@@ -103,8 +107,23 @@ See [examples](examples) for a complete settings file.
 2. That copy is copied to the other destinations while the card is checksummed.
 3. Every copy is checksummed and compared with the card.
 
-A card passes only when every file matches on every destination. The checksum list
-and a log for each offload are kept in `~/.local/state/dit-offloader`.
+A card passes only when every file matches on every destination. The checksum list is
+then saved in each destination folder as `dit-offloader_<job>_<time>.<algo>`, and a log
+for each offload is kept in `~/.local/state/dit-offloader`. To re-check a copy later,
+run this in the destination folder:
+
+```sh
+md5sum -c dit-offloader_CAMA_*.md5          # md5 (from coreutils)
+shasum -a 256 -c dit-offloader_CAMA_*.sha256
+xxhsum -c dit-offloader_CAMA_*.xxh128
+```
+
+Before copying, files that are already at a destination (from an earlier or interrupted
+run) are checked against the card. Matching ones are kept. If any differ, the offload
+stops and lists them, so you can move them aside.
+
+If an offload is stopped before it finishes (the Mac slept, lost power, or the process
+was killed), `status` shows it as `INTERRUPTED`. Do not erase that card; start it again.
 
 ## Using it over SSH
 
@@ -125,7 +144,7 @@ remote users** on the Mac that has the cards.
 
 ## Development
 
-```
+```sh
 tests/run-tests.sh
 ```
 

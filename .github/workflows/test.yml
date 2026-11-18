@@ -5,6 +5,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: brew install shellcheck
+      - run: brew install shellcheck xxhash
       - run: shellcheck -s bash bin/dit-offloader tests/run-tests.sh
       - run: tests/run-tests.sh

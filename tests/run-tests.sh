@@ -16,8 +16,18 @@ esac
 SHIM
 cat > "$T/bin/hdiutil" <<'SHIM'
 #!/bin/bash
-if [ "$1" = attach ]; then n="${2#/tmp/dit-offloader-fake-}"; mkdir -p "$DIT_OFFLOADER_VOLUMES/${n%-*}"; fi
+case "$1" in
+  attach) n="${2#/tmp/dit-offloader-fake-}"; mkdir -p "$DIT_OFFLOADER_VOLUMES/${n%-*}" ;;
+  detach) mv "$2" "$SHIM_EJECTED/$(basename "$2")-$$" ;;
+esac
 SHIM
+mkdir -p "$T/dfbin"
+cat > "$T/dfbin/df" <<'SHIM'
+#!/bin/bash
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "fakedisk 1000000 0 $FAKE_FREE_KB 0% /fake drive"
+SHIM
+chmod +x "$T/dfbin/df"
 chmod +x "$T/bin/"*
 export PATH="$T/bin:$PATH" SHIM_EJECTED="$T/ejected" DIT_OFFLOADER_ALLOW_NON_MAC=1
 export DIT_OFFLOADER_VOLUMES="$T/vol" DIT_OFFLOADER_STATE="$T/state" DIT_OFFLOADER_CONFIG="$T/config"
@@ -61,6 +71,8 @@ check "second destination has it" '[ -f "$V/two/My Show/Footage/$ISO/CAMA/XDROOT
 check "audio keeps original names" '[ -f "$V/two/My Show/Audio/$ISO/${TODAY}_001.TAKE/${TODAY}_001_Tr1.WAV" ]'
 check "old audio take skipped" '[ ! -e "$V/one/My Show/Audio/$ISO/200101_001.TAKE" ]'
 check "both jobs passed" '[ "$(grep -l "RESULT: PASS" "$T"/state/*.log | wc -l)" -eq 2 ]'
+check "checksum list saved on each destination" '[ "$(ls "$D"/dit-offloader_CAMA_*.md5 "$V/two/My Show/Footage/$ISO/CAMA"/dit-offloader_CAMA_*.md5 | wc -l)" -eq 2 ]'
+check "checksum list covers every file" '[ "$(wc -l < "$(ls "$D"/dit-offloader_CAMA_*.md5)")" -eq 4 ]'
 check "cards ejected, not renamed" '[ ! -e "$V/Untitled" ] && [ ! -e "$V/REC" ] && [ ! -e "$V/A" ]'
 
 echo "3. clips mode, renaming, three destinations"
@@ -82,7 +94,7 @@ sony_card "Untitled" A; sony_card "Untitled 1" B; audio_card "NO NAME"
 "$TOOL" start Gemes3 --to two --to "$V/three/deep" >/dev/null 2>&1; settle
 F="Gemes3-Media/11-Footage/$TODAY"; A="Gemes3-Media/12-Audio/$TODAY"
 check "camera A clips are flat" '[ -f "$V/one/$F/CAMA/A001L001_x.MXF" ] && [ ! -e "$V/one/$F/CAMA/XDROOT" ]'
-check "only clips copied" '[ "$(find "$V/one/$F/CAMB" -type f | wc -l)" -eq 2 ]'
+check "only clips copied" '[ "$(find "$V/one/$F/CAMB" -type f ! -name "dit-offloader_*" | wc -l)" -eq 2 ]'
 check "third destination by path" '[ -f "$V/three/deep/$F/CAMB/B001L002_x.MXF" ]'
 check "audio renamed with track name" '[ -f "$V/two/$A/${TODAY}_001.TAKE/$TODAY-Gemes3-Tk01-Tr1-OH.WAV" ]'
 check "unknown track keeps its name" '[ -f "$V/two/$A/${TODAY}_002.TAKE/$TODAY-Gemes3-Tk02-Tr5.WAV" ]'
@@ -95,6 +107,8 @@ reset; sony_card "Untitled" C
 mkdir -p "$V/two/$F/CAMC"; echo different > "$V/two/$F/CAMC/C001L001_x.MXF"
 "$TOOL" start Gemes3 --to two >/dev/null 2>&1; settle
 check "job reports FAIL" 'grep -q "RESULT: FAIL" "$T"/state/CAMC-*.log'
+check "nothing copied when a file differs" '[ ! -e "$V/one/$F/CAMC/C001L001_x.MXF" ]'
+check "the differing file is named" 'grep -q "two/$F/CAMC/C001L001_x.MXF" "$T"/state/CAMC-*.log'
 check "failed card stays mounted" '[ -d "$V/C" ]'
 check "existing file was not overwritten" '[ "$(cat "$V/two/$F/CAMC/C001L001_x.MXF")" = different ]'
 check "eject refuses a failed card" '! "$TOOL" eject C 2>/dev/null'
@@ -112,6 +126,72 @@ reset
 "$TOOL" rehearse --to two > "$T/rehearse.out" 2>&1
 check "rehearse passes for both fake cards" '[ "$(grep -c "RESULT: PASS" "$T/rehearse.out")" -eq 2 ]'
 check "rehearse lists what landed" 'grep -q "DIT-OFFLOADER-TEST-Media/12-Audio/.*RoomTone" "$T/rehearse.out"'
+
+echo "7. identical copies from an earlier run are kept"
+reset; sony_card "Untitled" A
+cat > "$T/config" <<CFG
+DESTINATIONS=("one")
+CFG
+mkdir -p "$V/one/P/Footage/$ISO/CAMA/XDROOT/Clip"
+cp "$V/Untitled/XDROOT/Clip/A001L001_x.MXF" "$V/one/P/Footage/$ISO/CAMA/XDROOT/Clip/"
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+check "job passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+check "matching copy is reported" 'grep -q "1 copies are already at a destination and match" "$T"/state/CAMA-*.log'
+
+echo "8. status and stale jobs"
+reset; mkdir -p "$T/state"
+echo 999999 > "$T/state/CAMQ.pid"; echo "12:00:00  Step 1/3: copying" > "$T/state/CAMQ-20260101-120000.log"
+check "unfinished job shows INTERRUPTED" '"$TOOL" status | grep -q "CAMQ: INTERRUPTED"'
+echo $$ > "$T/state/CAMA.pid"
+sony_card "Untitled" A
+check "reused pid does not block a new offload" '"$TOOL" start P --to two >/dev/null 2>&1'
+settle
+check "that offload passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+
+echo "9. start reports cards that did not start"
+reset; sony_card "Untitled" A; sony_card "MIX" A
+head -c 1000 /dev/urandom > "$V/MIX/XDROOT/Clip/B001L001_x.MXF"
+check "start exits with an error" '! "$TOOL" start P --to two >/dev/null 2>&1'
+settle
+check "the good card still passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+
+echo "10. audio after midnight"
+reset
+TOMORROW="$(date -j -v+1d '+%y%m%d' 2>/dev/null || date -d tomorrow '+%y%m%d')"
+audio_card "REC"; mkdir -p "$V/REC/${TOMORROW}_001.TAKE"; echo late > "$V/REC/${TOMORROW}_001.TAKE/${TOMORROW}_001_Tr1.WAV"
+"$TOOL" start P --to two --overnight >/dev/null 2>&1; settle
+check "next-day take copied with --overnight" '[ -f "$V/two/P/Audio/$ISO/${TOMORROW}_001.TAKE/${TOMORROW}_001_Tr1.WAV" ]'
+check "audio job passes" 'grep -q "RESULT: PASS" "$T"/state/AUDIO-*.log'
+
+echo "11. free space counts other running offloads"
+reset; sony_card "Untitled" A
+mkdir -p "$T/state"
+need="$(du -sk "$V/Untitled" | cut -f1)"
+PATH="$T/dfbin:$PATH" FAKE_FREE_KB=$((need - 50)) "$TOOL" start P --to two >/dev/null 2>&1; settle
+check "too little space fails" 'grep -q "not enough free space on /fake drive" "$T"/state/CAMA-*.log'
+rm -f "$T"/state/CAMA-*.log
+bash -c 'sleep 60; :' _run CAMQ camera Q & other=$!
+echo $other > "$T/state/CAMQ.pid"
+printf '%s
+%s
+' "$V/Q" "$V/one/elsewhere" > "$T/state/CAMQ.paths"
+printf '%s	%s
+' "$V/Q/big.MXF" big.MXF > "$T/state/CAMQ.plan"
+echo $((need + 100)) > "$T/state/CAMQ.sizes"
+PATH="$T/dfbin:$PATH" FAKE_FREE_KB=$((need * 2)) "$TOOL" start P --to two >/dev/null 2>&1; settle
+check "space held by a running offload is counted" 'grep -q "plus running offloads" "$T"/state/CAMA-*.log'
+kill $other 2>/dev/null; wait $other 2>/dev/null; rm -f "$T"/state/CAMA-*.log "$T/state/CAMQ".*
+PATH="$T/dfbin:$PATH" FAKE_FREE_KB=$((need * 2)) "$TOOL" start P --to two >/dev/null 2>&1; settle
+check "enough space passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+
+if command -v xxhsum >/dev/null 2>&1; then
+  echo "12. xxHash"
+  reset; sony_card "Untitled" A
+  echo 'HASH_ALGO="xxh128"' >> "$T/config"
+  "$TOOL" start P --to two >/dev/null 2>&1; settle
+  check "xxh128 offload passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+  check "xxh128 checksum list saved" 'ls "$V/two/P/Footage/$ISO/CAMA"/dit-offloader_CAMA_*.xxh128 >/dev/null 2>&1'
+fi
 
 echo
 if [ $fails = 0 ]; then echo "All tests passed."; else echo "$fails test(s) failed."; exit 1; fi
