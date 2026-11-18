@@ -5,12 +5,15 @@
 # Copies every card to all destinations, then re-reads the card and every copy and
 # compares checksums. It never deletes or overwrites a file.
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 CONFIG="${DIT_OFFLOADER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dit-offloader/config}"
 STATE="${DIT_OFFLOADER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dit-offloader}"
 VOLROOT="${DIT_OFFLOADER_VOLUMES:-/Volumes}"
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+# Find tools installed alongside this one (e.g. Homebrew's xxhsum), even when the
+# shell's PATH does not include that folder, as over a plain ssh command or from cron.
+PATH="$PATH:$(dirname "$SELF")"
 TEST_PROJECT="DIT-OFFLOADER-TEST"
 
 # ---------- settings (defaults; the config file overrides them) ----------
