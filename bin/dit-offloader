@@ -5,7 +5,7 @@
 # Copies every card to all destinations, then re-reads the card and every copy and
 # compares checksums. It never deletes or overwrites a file.
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 
 CONFIG="${DIT_OFFLOADER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dit-offloader/config}"
 STATE="${DIT_OFFLOADER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dit-offloader}"
@@ -17,6 +17,7 @@ PATH="$PATH:$(dirname "$SELF")"
 TEST_PROJECT="DIT-OFFLOADER-TEST"
 
 # ---------- settings (defaults; the config file overrides them) ----------
+PROJECT=""
 DESTINATIONS=()
 MIN_DESTINATIONS=2
 VIDEO_PATH='{project}/Footage/{date}/CAM{cam}'
@@ -48,7 +49,8 @@ dit-offloader $VERSION - verified camera and audio card offloads
   dit-offloader init                      create the settings file
   dit-offloader config                    show the settings in use
   dit-offloader list                      show mounted drives and recognised cards
-  dit-offloader start <project> [options] offload every recognised card
+  dit-offloader start [project] [options] offload every recognised card
+                                          (project: from the settings file if not given)
   dit-offloader status [--all] [--watch]  show progress bars and results
   dit-offloader eject <job>               eject a card that passed (e.g. A or AUDIO)
   dit-offloader rehearse [--to <drive>]   practice run with two small fake cards
@@ -315,6 +317,10 @@ cmd_init() {
   cat > "$CONFIG" <<'TEMPLATE'
 # dit-offloader settings. Lines starting with # are notes.
 
+# Project name used by "start" when you don't give one: dit-offloader start
+# A name given on the command line wins: dit-offloader start OtherProject
+#PROJECT="MyProject"
+
 # Where every offload goes: drive names (as shown in Finder) or full folder paths.
 # Add more for a single run with:  dit-offloader start <project> --to "<drive>"
 DESTINATIONS=("MyBackupDrive")
@@ -411,6 +417,7 @@ resolve_destinations() {
   for d in "${DESTINATIONS[@]}" "${EXTRA[@]}"; do
     [ -n "$d" ] || continue
     r="$(dest_root "$d")"
+    case "$d" in *,*) [ -d "$r" ] || die "destination \"$d\" is not available. Separate drives with spaces, not commas: (\"Drive1\" \"Drive2\")" ;; esac
     [ -d "$r" ] || die "destination $r is not available"
     for seen in "${ROOTS[@]}"; do [ "$seen" = "$r" ] && die "destination $r is listed twice"; done
     ROOTS+=("$r")
@@ -429,8 +436,8 @@ is_destination() {   # is drive folder $1 a destination, or does it hold one?
 
 cmd_start() {
   need_mac; load_config
-  local card="" cam="" v name any=0 failed=0
-  PROJECT=""; EXTRA=(); DAY_ISO="$(date '+%Y-%m-%d')"; OVERNIGHT=no
+  local card="" cam="" v name any=0 failed=0 project=""
+  EXTRA=(); DAY_ISO="$(date '+%Y-%m-%d')"; OVERNIGHT=no
   while [ $# -gt 0 ]; do
     case "$1" in
       --to)   [ -n "$2" ] || die "--to needs a drive name"; EXTRA+=("$2"); shift 2 ;;
@@ -439,10 +446,11 @@ cmd_start() {
       --day)  [ -n "$2" ] || die "--day needs a date"; DAY_ISO="$2"; shift 2 ;;
       --overnight) OVERNIGHT=yes; shift ;;
       -*)     die "unknown option $1 (see: dit-offloader --help)" ;;
-      *)      [ -z "$PROJECT" ] || die "unexpected extra word \"$1\" (drives go after --to)"; PROJECT="$1"; shift ;;
+      *)      [ -z "$project" ] || die "unexpected extra word \"$1\" (drives go after --to)"; project="$1"; shift ;;
     esac
   done
-  [ -n "$PROJECT" ] || die "usage: dit-offloader start <project> [--to \"<drive>\"]"
+  PROJECT="${project:-$PROJECT}"
+  [ -n "$PROJECT" ] || die "no project name. Use: dit-offloader start <project>, or set PROJECT in $CONFIG"
   case "$PROJECT" in */*) die "project name cannot contain a slash" ;; esac
   [ -z "$cam" ] || [ -n "$card" ] || die "--cam needs --card, so it is clear which card it is for"
   DATE_LABEL="$(fmt_day "$DATE_FORMAT")" || die "could not understand the day \"$DAY_ISO\" (use YYYY-MM-DD)"

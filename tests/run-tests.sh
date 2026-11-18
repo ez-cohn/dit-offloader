@@ -121,6 +121,16 @@ check "--cam without --card is refused" '! "$TOOL" start P --to two --cam B 2>/d
 check "missing destination is refused" '! "$TOOL" start P --to nowhere 2>/dev/null'
 check "version prints" '"$TOOL" --version | grep -q "dit-offloader [0-9]"'
 
+check "commas between drives get a hint" '"$TOOL" start P --to "two,three" 2>&1 | grep -q "not commas"'
+check "start without a project is refused" '! "$TOOL" start --to two 2>/dev/null'
+reset; sony_card "CARD9" A
+echo 'PROJECT="FromSettings"' >> "$T/config"
+"$TOOL" start --to two --card CARD9 --day 2026-01-02 >/dev/null 2>&1; settle
+check "project comes from the settings" '[ -f "$V/one/FromSettings-Media/11-Footage/260102/CAMA/A001L001_x.MXF" ]'
+reset; sony_card "CARD9" A
+"$TOOL" start Override --to two --card CARD9 --day 2026-01-02 >/dev/null 2>&1; settle
+check "project on the command line wins" '[ -f "$V/one/Override-Media/11-Footage/260102/CAMA/A001L001_x.MXF" ]'
+
 echo "6. rehearse"
 reset
 "$TOOL" rehearse --to two > "$T/rehearse.out" 2>&1

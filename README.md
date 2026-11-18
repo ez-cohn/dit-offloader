@@ -75,7 +75,7 @@ with speed and time left:
 | `init` | Create the settings file |
 | `config` | Show the settings in use |
 | `list` | Show mounted drives and which ones look like cards |
-| `start <project>` | Offload every recognised card |
+| `start [project]` | Offload every recognised card. Without a project name, uses `PROJECT` from the settings |
 | `status [--all] [--watch]` | Show progress bars and results (last 24 hours, or everything). `--watch` keeps the screen updated until the offloads finish |
 | `eject <job>` | Eject a passed card by hand, e.g. `eject A` or `eject AUDIO` |
 | `rehearse` | Practice run with fake cards |
@@ -96,7 +96,8 @@ Options for `start`:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `DESTINATIONS` | none | Drives or folders every offload goes to |
+| `PROJECT` | none | Project name used by `start` when none is given on the command line |
+| `DESTINATIONS` | none | Drives or folders every offload goes to. Separate them with spaces: `("Drive1" "Drive2")` |
 | `MIN_DESTINATIONS` | `2` | Refuse to start with fewer destinations |
 | `VIDEO_PATH` | `{project}/Footage/{date}/CAM{cam}` | Folder layout for video |
 | `AUDIO_PATH` | `{project}/Audio/{date}` | Folder layout for audio |
