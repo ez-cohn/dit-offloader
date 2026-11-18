@@ -56,7 +56,8 @@ dit-offloader status --watch
 ```
 
 While an offload runs, `status` shows a progress bar for each copy and each checksum,
-with speed and time left:
+with speed and time left. `status --watch` updates those bars in place every 2 seconds
+until the offloads finish (Ctrl-C stops watching; the offloads keep running):
 
 ```
 ===== CAMA: RUNNING =====

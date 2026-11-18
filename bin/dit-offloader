@@ -5,7 +5,7 @@
 # Copies every card to all destinations, then re-reads the card and every copy and
 # compares checksums. It never deletes or overwrites a file.
 
-VERSION="0.2.2"
+VERSION="0.2.3"
 
 CONFIG="${DIT_OFFLOADER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dit-offloader/config}"
 STATE="${DIT_OFFLOADER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dit-offloader}"
@@ -780,6 +780,46 @@ show_progress() {    # bars for running job $1
   done
 }
 
+# "status --watch": redraws the status in place every 2 seconds, like a download
+# progress bar, so earlier screens do not pile up in the terminal's scrollback.
+watch_status() {
+  local screen line rows n drawn=0 shown
+  if [ ! -t 1 ]; then          # not a terminal: print a fresh status every 2 seconds
+    while :; do
+      cmd_status "$@"; [ "$(running_jobs)" -gt 0 ] || return 0; sleep 2
+    done
+  fi
+  # Hide the cursor and clip long lines instead of wrapping them while watching.
+  printf '\033[?25l\033[?7l'
+  trap 'printf "\033[?7h\033[?25h\n"; exit 0' INT TERM
+  trap 'printf "\033[?7h\033[?25h"' EXIT
+  while :; do
+    screen="$(WATCHING=yes cmd_status "$@")"
+    if [ "$(running_jobs)" -gt 0 ]; then
+      screen="$screen"$'\n'"Updating every 2 seconds. Ctrl-C stops watching; the offloads keep running."
+    else
+      screen="$screen"$'\n'"No offloads running."
+    fi
+    rows="$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f1)"
+    case "$rows" in ''|*[!0-9]*) rows=40 ;; esac
+    n="$(printf '%s\n' "$screen" | wc -l | tr -d ' ')"
+    [ "$drawn" = 0 ] || printf '\033[%dA\r' "$drawn"
+    shown=0
+    while IFS= read -r line; do
+      if [ "$n" -ge "$rows" ] && [ $shown -eq $((rows - 2)) ]; then
+        printf '... %d more lines; make the window taller to see them\033[K\n' $((n - shown))
+        shown=$((shown + 1)); break
+      fi
+      printf '%s\033[K\n' "$line"
+      shown=$((shown + 1))
+    done <<< "$screen"
+    printf '\033[J'
+    drawn=$shown
+    [ "$(running_jobs)" -gt 0 ] || return 0
+    sleep 2
+  done
+}
+
 cmd_status() {
   local found=0 p job state log all="no" watch="no"
   while [ $# -gt 0 ]; do
@@ -791,15 +831,10 @@ cmd_status() {
     shift
   done
   if [ "$watch" = yes ]; then
-    local screen args=()
+    local args=()
     [ "$all" = no ] || args=(--all)
-    while :; do
-      screen="$(cmd_status "${args[@]}")"
-      printf '\033[H\033[2J%s\n\n' "$screen"
-      [ "$(running_jobs)" -gt 0 ] || { echo "No offloads running."; return 0; }
-      echo "Updating every 2 seconds. Ctrl-C stops watching; the offloads keep running."
-      sleep 2
-    done
+    watch_status "${args[@]}"
+    return
   fi
   BAR_WIDTH=24; BAR_ON="#"; BAR_OFF="."
   case "${LC_ALL:-${LC_CTYPE:-$LANG}}" in *UTF-8*|*utf8*|*UTF8*) BAR_ON="█"; BAR_OFF="░" ;; esac
@@ -817,7 +852,9 @@ cmd_status() {
     echo "===== $job: $state ====="
     if [ "$state" = RUNNING ]; then
       show_progress "$job"
-      [ -n "$log" ] && grep -v '^              ' "$log" | tail -3
+      [ "$WATCHING" = yes ] || { [ -n "$log" ] && grep -v '^              ' "$log" | tail -3; }
+    elif [ "$WATCHING" = yes ]; then
+      [ -n "$log" ] && grep "RESULT:" "$log" | tail -1
     else
       [ -n "$log" ] && grep -v '^              ' "$log" | tail -8
     fi
