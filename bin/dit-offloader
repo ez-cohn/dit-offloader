@@ -46,7 +46,7 @@ dit-offloader $VERSION - verified camera and audio card offloads
   dit-offloader config                    show the settings in use
   dit-offloader list                      show mounted drives and recognised cards
   dit-offloader start <project> [options] offload every recognised card
-  dit-offloader status [--all]            show progress and results
+  dit-offloader status [--all] [--watch]  show progress bars and results
   dit-offloader eject <job>               eject a card that passed (e.g. A or AUDIO)
   dit-offloader rehearse [--to <drive>]   practice run with two small fake cards
 
@@ -234,18 +234,30 @@ copy_between() {     # from folder $1 into folder $2
   return $rc
 }
 
+# Both checksum functions note their progress in their last argument's file, for "status":
+# "<KB checksummed so far><TAB><KB of the current file><TAB><current file>".
 hash_card() {        # checksums of the files on the card, into file $1
-  local s r h
-  while IFS=$'\t' read -r s r; do
-    h="$(hash_of "$s")"; printf '%s  %s\n' "${h:-UNREADABLE}" "$r"
-  done < "$PLAN" | sort > "$1"
+  local s r h k sofar=0
+  {
+    while IFS=$'\t' read -r k s r; do
+      printf '%s\t%s\t%s\n' "$sofar" "$k" "$s" > "$2"
+      h="$(hash_of "$s")"; printf '%s  %s\n' "${h:-UNREADABLE}" "$r"
+      sofar=$((sofar + k))
+    done
+    printf '%s\t0\t\n' "$sofar" > "$2"
+  } < <(paste "$SIZES" "$PLAN") | sort > "$1"
 }
 
 hash_dest() {        # checksums of the copies in folder $1, into file $2
-  local s r h
-  while IFS=$'\t' read -r s r; do
-    h="$(hash_of "$1/$r")"; printf '%s  %s\n' "${h:-MISSING}" "$r"
-  done < "$PLAN" | sort > "$2"
+  local s r h k sofar=0
+  {
+    while IFS=$'\t' read -r k s r; do
+      printf '%s\t%s\t%s\n' "$sofar" "$k" "$1/$r" > "$3"
+      h="$(hash_of "$1/$r")"; printf '%s  %s\n' "${h:-MISSING}" "$r"
+      sofar=$((sofar + k))
+    done
+    printf '%s\t0\t\n' "$sofar" > "$3"
+  } < <(paste "$SIZES" "$PLAN") | sort > "$2"
 }
 
 free_kb() {
@@ -511,8 +523,8 @@ cmd_run() {
   local stamp; stamp="$(date '+%Y%m%d-%H%M%S')"
   local work="$STATE/work-$job-$stamp"
   mkdir -p "$work"
-  PLAN="$STATE/$job.plan"
-  rm -f "$STATE/$job.sizes"
+  PLAN="$STATE/$job.plan"; SIZES="$STATE/$job.sizes"
+  rm -f "$SIZES" "$STATE/$job.progress" "$STATE/$job".hash-*
   { echo "$src"; for r in "${dests[@]}"; do echo "$r"; done; } > "$STATE/$job.paths"
 
   say "$job offload starting (dit-offloader $VERSION)"
@@ -596,9 +608,23 @@ cmd_run() {
            awk -F'\t' '{ n[$1] += $2 } END { for (m in n) print m "\t" n[m] }')
   unlock_space
 
+  # For the progress bars in "status": what each destination held before copying,
+  # what it still needs, and when each step started.
+  local base
+  i=0
+  for d in "${dests[@]}"; do
+    i=$((i + 1))
+    base="$(du -sk "$d" 2>/dev/null | cut -f1)"
+    printf 'dest\t%s\t%s\t%s\n' "$i" "${base:-0}" "$(sed -n "${i}p" "$work/space-mine.txt" | cut -f2)"
+  done > "$work/progress"
+  printf 'total\t%s\n' "$kb" >> "$work/progress"
+  mv "$work/progress" "$STATE/$job.progress"
+
+  printf 'step\t1\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
   say "Step 1/3: copying the card to destination 1"
   copy_from_card "${dests[0]}" || say "  note: cp reported a problem; verification will show if it matters"
 
+  printf 'step\t2\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
   say "Step 2/3: copying destination 1 to the other destinations, and checksumming the card"
   local pids=()
   i=1
@@ -608,14 +634,15 @@ cmd_run() {
     pids+=($!)
     i=$((i + 1))
   done
-  hash_card "$work/card.$HASH_ALGO"
+  hash_card "$work/card.$HASH_ALGO" "$STATE/$job.hash-card"
   for k in "${pids[@]}"; do wait "$k"; done
 
+  printf 'step\t3\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
   say "Step 3/3: checksumming every copy"
   pids=()
   i=0
   while [ $i -lt "$n" ]; do
-    hash_dest "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" &
+    hash_dest "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" "$STATE/$job.hash-dest$((i + 1))" &
     pids+=($!)
     i=$((i + 1))
   done
@@ -658,9 +685,114 @@ running_jobs() {
   echo $n
 }
 
+# ---------- progress bars ----------
+
+kb_text() {          # 1536 -> "1.5 MB"
+  awk -v k="$1" 'BEGIN {
+    if (k >= 1048576) printf "%.1f GB", k / 1048576
+    else printf "%.1f MB", k / 1024 }'
+}
+
+time_text() {        # 75 -> "1m15s"
+  if [ "$1" -ge 3600 ]; then printf '%dh%02dm' $(($1 / 3600)) $(($1 % 3600 / 60))
+  elif [ "$1" -ge 60 ]; then printf '%dm%02ds' $(($1 / 60)) $(($1 % 60))
+  else printf '%ds' "$1"; fi
+}
+
+# One progress line: label, KB done, KB in all, seconds since this part started.
+bar() {
+  local label="$1" have="$2" total="$3" secs="$4" pct full line
+  [ "$total" -gt 0 ] || { total=1; have=1; }
+  [ "$have" -le "$total" ] || have="$total"
+  [ "$have" -ge 0 ] || have=0
+  pct=$((have * 100 / total))
+  full=$((pct * BAR_WIDTH / 100))
+  line="$(printf '%*s' "$full" '')"; line="${line// /$BAR_ON}"
+  line="$line$(printf '%*s' $((BAR_WIDTH - full)) '')"
+  line="${line// /$BAR_OFF}"
+  printf '  %-24s %s %3d%%  %s of %s' "$label" "$line" "$pct" "$(kb_text "$have")" "$(kb_text "$total")"
+  if [ "$pct" -lt 100 ] && [ "$have" -gt 0 ] && [ "$secs" -gt 0 ]; then
+    printf '  %s/s, about %s left' "$(kb_text $((have / secs)))" "$(time_text $(((total - have) * secs / have)))"
+  fi
+  echo
+}
+
+waiting() { printf '  %-24s waiting\n' "$1"; }
+
+# How far each running checksum has read into its current file: "<KB><TAB><file>" lines.
+read_offsets() {
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -o -o 0 -F no -c md5 -c xxhsum -c shasum -c md5sum -c perl 2>/dev/null |
+    awk '/^o0t/ { o = substr($0, 4) } /^n/ { print int(o / 1024) "\t" substr($0, 2) }'
+}
+
+hash_bar() {         # label, progress file, KB in all, seconds since the step started
+  local sofar k f cur
+  [ -f "$2" ] || { bar "$1" 0 "$3" "$4"; return; }
+  IFS=$'\t' read -r sofar k f < "$2"
+  cur=0
+  [ -z "$f" ] || cur="$(printf '%s\n' "$OFFSETS" | awk -F'\t' -v f="$f" '$2 == f && $1 > n { n = $1 } END { print n + 0 }')"
+  [ "$cur" -le "${k:-0}" ] || cur="$k"
+  bar "$1" $((sofar + cur)) "$3" "$4"
+}
+
+show_progress() {    # bars for running job $1
+  local job="$1" p="$STATE/$1.progress" now step started total i n d base need have
+  [ -f "$p" ] || { echo "  preparing: listing the card and checking the destinations"; return; }
+  now="$(date +%s)"
+  step="$(awk -F'\t' '$1 == "step" { s = $2 } END { print s + 0 }' "$p")"
+  started="$(awk -F'\t' '$1 == "step" { t = $3 } END { print t + 0 }' "$p")"
+  total="$(awk -F'\t' '$1 == "total" { print $2 }' "$p")"
+  n="$(grep -c '^dest' "$p")"
+  echo "  step $step of 3, $(time_text $((now - started))) into this step"
+  i=0
+  while IFS= read -r d; do
+    i=$((i + 1))
+    read -r base need <<< "$(awk -F'\t' -v i="$i" '$1 == "dest" && $2 == i { print $3, $4 }' "$p")"
+    if [ "$i" = 1 ] && [ "$step" -ge 2 ] || [ "$step" -ge 3 ]; then
+      bar "copy to destination $i" "$need" "$need" 0
+    elif [ "$i" -gt 1 ] && [ "$step" -lt 2 ]; then
+      waiting "copy to destination $i"
+    else
+      have=$(( $(du -sk "$d" 2>/dev/null | cut -f1) - base ))
+      bar "copy to destination $i" "$have" "$need" $((now - started))
+    fi
+  done < <(tail -n +2 "$STATE/$job.paths")
+  if [ "$step" -lt 2 ]; then waiting "checksum card"
+  elif [ "$step" -ge 3 ]; then bar "checksum card" "$total" "$total" 0
+  else hash_bar "checksum card" "$STATE/$job.hash-card" "$total" $((now - started)); fi
+  i=0
+  while [ $i -lt "$n" ]; do
+    i=$((i + 1))
+    if [ "$step" -lt 3 ]; then waiting "checksum destination $i"
+    else hash_bar "checksum destination $i" "$STATE/$job.hash-dest$i" "$total" $((now - started)); fi
+  done
+}
+
 cmd_status() {
-  local found=0 p job state log total s r d c i line
-  local all="no"; [ "$1" = "--all" ] && all="yes"
+  local found=0 p job state log all="no" watch="no"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)   all="yes" ;;
+      --watch) watch="yes" ;;
+      *) die "usage: dit-offloader status [--all] [--watch]" ;;
+    esac
+    shift
+  done
+  if [ "$watch" = yes ]; then
+    local screen args=()
+    [ "$all" = no ] || args=(--all)
+    while :; do
+      screen="$(cmd_status "${args[@]}")"
+      printf '\033[H\033[2J%s\n\n' "$screen"
+      [ "$(running_jobs)" -gt 0 ] || { echo "No offloads running."; return 0; }
+      echo "Updating every 2 seconds. Ctrl-C stops watching; the offloads keep running."
+      sleep 2
+    done
+  fi
+  BAR_WIDTH=24; BAR_ON="#"; BAR_OFF="."
+  case "${LC_ALL:-${LC_CTYPE:-$LANG}}" in *UTF-8*|*utf8*|*UTF8*) BAR_ON="█"; BAR_OFF="░" ;; esac
+  OFFSETS="$(read_offsets)"
   for p in "$STATE"/*.pid; do
     [ -f "$p" ] || continue
     if [ "$all" = no ] && [ -z "$(find "$p" -mmin -1440 2>/dev/null)" ]; then continue; fi
@@ -672,20 +804,12 @@ cmd_status() {
     elif [ -n "$log" ] && grep -q "RESULT:" "$log"; then state="finished"
     else state="INTERRUPTED"; fi
     echo "===== $job: $state ====="
-    if [ "$state" = RUNNING ] && [ -f "$STATE/$job.paths" ] && [ -f "$STATE/$job.plan" ]; then
-      total=$(wc -l < "$STATE/$job.plan" | tr -d ' ')
-      i=0
-      while IFS= read -r d; do
-        if [ $i -gt 0 ]; then
-          c=0
-          while IFS=$'\t' read -r s r; do [ -e "$d/$r" ] && c=$((c + 1)); done < "$STATE/$job.plan"
-          line="files arrived at destination $i: $c/$total ($(du -sh "$d" 2>/dev/null | cut -f1))"
-          echo "$line"
-        fi
-        i=$((i + 1))
-      done < "$STATE/$job.paths"
+    if [ "$state" = RUNNING ]; then
+      show_progress "$job"
+      [ -n "$log" ] && grep -v '^              ' "$log" | tail -3
+    else
+      [ -n "$log" ] && grep -v '^              ' "$log" | tail -8
     fi
-    [ -n "$log" ] && grep -v '^              ' "$log" | tail -8
     [ "$state" != INTERRUPTED ] ||
       echo "RESULT: INTERRUPTED - $job stopped before it finished. Do NOT erase this card; start it again."
     echo
@@ -798,7 +922,7 @@ case "$1" in
   list)       cmd_list ;;
   start)      shift; cmd_start "$@" ;;
   _run)       cmd_run "$2" "$3" "$4" ;;
-  status)     cmd_status "$2" ;;
+  status)     shift; cmd_status "$@" ;;
   eject)      cmd_eject "$2" ;;
   rehearse)   shift; cmd_rehearse "$@" ;;
   --version|-v|version) echo "dit-offloader $VERSION" ;;

@@ -52,7 +52,20 @@ For a real shoot, plug in the cards and run:
 
 ```sh
 dit-offloader start MyProject --to "SecondDrive"
-dit-offloader status
+dit-offloader status --watch
+```
+
+While an offload runs, `status` shows a progress bar for each copy and each checksum,
+with speed and time left:
+
+```
+===== CAMA: RUNNING =====
+  step 3 of 3, 13s into this step
+  copy to destination 1    ████████████████████████ 100%  8.0 GB of 8.0 GB
+  copy to destination 2    ████████████████████████ 100%  8.0 GB of 8.0 GB
+  checksum card            ████████████████████████ 100%  8.0 GB of 8.0 GB
+  checksum destination 1   █████████████░░░░░░░░░░░  56%  4.5 GB of 8.0 GB  357.6 MB/s, about 9s left
+  checksum destination 2   █████████████░░░░░░░░░░░  56%  4.5 GB of 8.0 GB  357.2 MB/s, about 9s left
 ```
 
 ## Commands
@@ -63,7 +76,7 @@ dit-offloader status
 | `config` | Show the settings in use |
 | `list` | Show mounted drives and which ones look like cards |
 | `start <project>` | Offload every recognised card |
-| `status [--all]` | Show progress and results (last 24 hours, or everything) |
+| `status [--all] [--watch]` | Show progress bars and results (last 24 hours, or everything). `--watch` keeps the screen updated until the offloads finish |
 | `eject <job>` | Eject a passed card by hand, e.g. `eject A` or `eject AUDIO` |
 | `rehearse` | Practice run with fake cards |
 

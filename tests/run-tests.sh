@@ -184,8 +184,23 @@ kill $other 2>/dev/null; wait $other 2>/dev/null; rm -f "$T"/state/CAMA-*.log "$
 PATH="$T/dfbin:$PATH" FAKE_FREE_KB=$((need * 2)) "$TOOL" start P --to two >/dev/null 2>&1; settle
 check "enough space passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
 
+echo "12. progress bars"
+reset; mkdir -p "$T/state" "$V/two/P"
+head -c 1048576 /dev/zero > "$V/two/P/part.MXF"
+bash -c 'sleep 60; :' _run CAMQ camera Q & other=$!
+echo $other > "$T/state/CAMQ.pid"
+printf '%s\n%s\n%s\n' "$V/Q" "$V/one/P" "$V/two/P" > "$T/state/CAMQ.paths"
+printf 'dest\t1\t0\t2048\ndest\t2\t0\t2048\ntotal\t4096\nstep\t2\t%s\n' "$(date +%s)" > "$T/state/CAMQ.progress"
+printf '1024\t1024\t%s\n' "$V/Q/clip.MXF" > "$T/state/CAMQ.hash-card"
+LANG=C "$TOOL" status > "$T/status.out"
+kill $other 2>/dev/null; wait $other 2>/dev/null
+check "first copy shows done" 'grep -q "copy to destination 1 *#* 100%" "$T/status.out"'
+check "second copy shows bytes arrived" 'grep -q "copy to destination 2 *#*\.* *5[0-9]%" "$T/status.out"'
+check "card checksum shows its share" 'grep -q "checksum card *#*\.* *25%" "$T/status.out"'
+check "copy checksums are waiting" 'grep -q "checksum destination 2 *waiting" "$T/status.out"'
+
 if command -v xxhsum >/dev/null 2>&1; then
-  echo "12. xxHash"
+  echo "13. xxHash"
   reset; sony_card "Untitled" A
   echo 'HASH_ALGO="xxh128"' >> "$T/config"
   "$TOOL" start P --to two >/dev/null 2>&1; settle
