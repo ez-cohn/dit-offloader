@@ -368,5 +368,58 @@ check "header says everything runs at once" 'grep -q "copying and checksumming a
 check "second copy shows bytes arrived" 'grep -q "copy to destination 2 *#*\.* *5[0-9]%" "$T/status.out"'
 check "copy checksums run, not waiting" 'grep -q "checksum destination 2 *#*\.* *25%" "$T/status.out" && ! grep -q waiting "$T/status.out"'
 
+echo "19. progress bars right after start"
+reset; sony_card "Untitled" A
+cat > "$T/config" <<CFG
+DESTINATIONS=("one")
+COPY_MODE="parallel"
+WATCH_ON_START="yes"
+CFG
+"$TOOL" start P --to two > "$T/start.out" 2>&1; settle
+check "without a terminal it says so instead of flooding" 'grep -q "no terminal. Use ssh -t" "$T/start.out"'
+check "and the offload passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+printf 'DESTINATIONS=("one")\nWATCH_ON_START="maybe"\n' > "$T/config.bad"
+check "a bad WATCH_ON_START is refused" 'DIT_OFFLOADER_CONFIG="$T/config.bad" "$TOOL" start P --to two 2>&1 | grep -q "WATCH_ON_START must be yes or no"'
+
+if command -v python3 >/dev/null 2>&1; then
+  # Run start in a simulated terminal, press Ctrl-C while the bars show, and check that
+  # only the watching stops. A slow tee keeps the offload busy long enough.
+  mkdir -p "$T/slowbin"
+  printf '#!/bin/bash\nsleep 3\nexec "%s" "$@"\n' "$REAL_TEE" > "$T/slowbin/tee"
+  chmod +x "$T/slowbin/tee"
+  reset; sony_card "Untitled" A
+  cat > "$T/press_ctrl_c.py" <<'PYTHON'
+import os, pty, select, sys, time
+tool, out = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(tool, [tool, "start", "P", "--to", "two"])
+buf, sent, start = b"", False, time.time()
+while time.time() - start < 60:
+    ready, _, _ = select.select([fd], [], [], 0.5)
+    if ready:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        buf += data
+    if not sent and b"copy to destination" in buf:
+        time.sleep(0.5)
+        os.write(fd, b"\x03")
+        sent = True
+_, status = os.waitpid(pid, 0)
+open(out, "wb").write(buf)
+print("sent" if sent else "not-sent", "exited", os.WEXITSTATUS(status))
+PYTHON
+  PATH="$T/slowbin:$PATH" python3 "$T/press_ctrl_c.py" "$TOOL" "$T/pty.out" > "$T/pty.result"
+  check "start shows the progress bars" 'grep -q "copying and checksumming at the same time" "$T/pty.out"'
+  check "Ctrl-C stops the watching" 'grep -q "^sent exited" "$T/pty.result"'
+  check "the offload was still running after Ctrl-C" '"$TOOL" status 2>/dev/null | grep -q "CAMA: RUNNING"'
+  settle
+  check "and it finishes and passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+fi
+
 echo
 if [ $fails = 0 ]; then echo "All tests passed."; else echo "$fails test(s) failed."; exit 1; fi

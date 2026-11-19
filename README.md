@@ -57,6 +57,10 @@ dit-offloader start MyProject --to "SecondDrive"
 dit-offloader status --watch
 ```
 
+With `WATCH_ON_START="yes"` in the settings (or `start --watch`), `start` goes straight on
+to show the progress bars. Ctrl-C stops watching; the offloads keep running. That needs a
+terminal window: over SSH, connect first or use `ssh -t host dit-offloader start`.
+
 While an offload runs, `status` shows a progress bar for each copy and each checksum,
 with speed and time left. `status --watch` updates those bars in place every 2 seconds
 until the offloads finish (Ctrl-C stops watching; the offloads keep running):
@@ -94,6 +98,7 @@ Options for `start`:
 | `--day YYYY-MM-DD` | Shoot day, if it is not today |
 | `--overnight` | Also take audio takes dated the day after the shoot day, for shoots past midnight |
 | `--parallel` / `--staged` | Copy in parallel or in stages for this run, whatever `COPY_MODE` says |
+| `--watch` / `--no-watch` | Show the progress bars right after starting, or don't, whatever `WATCH_ON_START` says |
 
 ## Settings
 
@@ -121,6 +126,7 @@ shows the described version without changing yours. The main settings:
 | `HASH_ALGO` | `md5` | `md5`, `sha1`, `sha256`, `xxh64` or `xxh128` (the xxHash ones are much faster) |
 | `COPY_MODE` | `staged` | `staged` or `parallel` (see below) |
 | `CHECKSUM_FILE` | `list` | `list`, `mhl`, `ascmhl` or `none` (see below) |
+| `WATCH_ON_START` | `no` | `yes` shows the progress bars right after `start`, as `status --watch` does |
 
 See [examples](examples) for a complete settings file.
 

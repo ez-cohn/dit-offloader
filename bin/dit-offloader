@@ -5,7 +5,7 @@
 # Copies every card to all destinations, then re-reads the card and every copy and
 # compares checksums. It never deletes or overwrites a file.
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 
 CONFIG="${DIT_OFFLOADER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dit-offloader/config}"
 STATE="${DIT_OFFLOADER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dit-offloader}"
@@ -40,6 +40,7 @@ AUTO_EJECT="yes"
 HASH_ALGO="md5"
 COPY_MODE="staged"
 CHECKSUM_FILE="list"
+WATCH_ON_START="no"
 
 say() { echo "$(date '+%H:%M:%S')  $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -69,6 +70,9 @@ Options for start:
   --parallel         copy to every destination and checksum at the same time
   --staged           copy and checksum one stage after another
                      (both override COPY_MODE in the settings file)
+  --watch            show the progress bars once the offloads start (as status --watch)
+  --no-watch         just start them and return
+                     (both override WATCH_ON_START in the settings file)
 
 Settings file: $CONFIG
 USAGE
@@ -87,6 +91,7 @@ load_config() {
   esac
   case "$AUDIO_ROOMTONE" in last|none) ;; *) die "AUDIO_ROOMTONE must be last or none" ;; esac
   case "$COPY_MODE" in staged|parallel) ;; *) die "COPY_MODE must be staged or parallel" ;; esac
+  case "$WATCH_ON_START" in yes|no) ;; *) die "WATCH_ON_START must be yes or no" ;; esac
   case "$CHECKSUM_FILE" in
     list|none) ;;
     mhl)
@@ -697,6 +702,14 @@ HASH_ALGO="md5"
 #   none   = no file (the checksums are still kept in the logs)
 CHECKSUM_FILE="list"
 
+# WATCH_ON_START: show the progress bars right after "start", as "status --watch" does.
+#   yes = start the offloads, then keep the progress bars on screen until they finish.
+#         Ctrl-C stops watching; the offloads keep running.
+#   no  = start the offloads and return to the prompt (default)
+#   Needs a terminal window: over ssh, connect with ssh -t (or just "ssh host" and type the
+#   command). Override for one run with: start --watch   or   start --no-watch
+WATCH_ON_START="no"
+
 # AUTO_EJECT: eject a card once every copy has been verified.
 #   yes = eject (default). A card that is still mounted afterwards has not passed.
 #   no  = leave it mounted; eject later with: dit-offloader eject A
@@ -777,6 +790,8 @@ cmd_start() {
       --overnight) OVERNIGHT=yes; shift ;;
       --parallel) COPY_MODE=parallel; shift ;;
       --staged)   COPY_MODE=staged; shift ;;
+      --watch)    WATCH_ON_START=yes; shift ;;
+      --no-watch) WATCH_ON_START=no; shift ;;
       -*)     die "unknown option $1 (see: dit-offloader --help)" ;;
       *)      [ -z "$project" ] || die "unexpected extra word \"$1\" (drives go after --to)"; project="$1"; shift ;;
     esac
@@ -790,18 +805,32 @@ cmd_start() {
   echo "Project: $PROJECT   Day: $DATE_LABEL   Destinations: ${#ROOTS[@]}   Copying: $COPY_MODE"
   for v in "${ROOTS[@]}"; do echo "  $v"; done
 
-  if [ -n "$card" ]; then start_one "$card" "$cam"; return; fi
-  for v in "$VOLROOT"/*; do
-    [ -d "$v" ] && [ ! -L "$v" ] || continue
-    is_destination "$v" && continue
-    if is_audio_card "$v" || is_camera_card "$v"; then
-      any=1
-      echo "--- $(basename "$v")"
-      ( start_one "$(basename "$v")" "" ) || failed=$((failed + 1))
+  if [ -n "$card" ]; then
+    ( start_one "$card" "$cam" ) || exit 1
+  else
+    for v in "$VOLROOT"/*; do
+      [ -d "$v" ] && [ ! -L "$v" ] || continue
+      is_destination "$v" && continue
+      if is_audio_card "$v" || is_camera_card "$v"; then
+        any=1
+        echo "--- $(basename "$v")"
+        ( start_one "$(basename "$v")" "" ) || failed=$((failed + 1))
+      fi
+    done
+    [ $any = 1 ] || die "no camera or audio card found (see: dit-offloader list)"
+  fi
+  [ $failed = 0 ] || echo "ERROR: $failed card(s) did not start; see the messages above" >&2
+  if [ "$WATCH_ON_START" = yes ] && [ "$(running_jobs)" -gt 0 ]; then
+    if [ -t 1 ]; then
+      echo
+      watch_status
+    else
+      # Without a terminal (e.g. ssh host 'dit-offloader start') the screen cannot be
+      # redrawn in place; repeating the whole status every 2 seconds would flood it.
+      echo "Not showing progress bars: no terminal. Use ssh -t, or run: dit-offloader status --watch"
     fi
-  done
-  [ $any = 1 ] || die "no camera or audio card found (see: dit-offloader list)"
-  [ $failed = 0 ] || die "$failed card(s) did not start; see the messages above"
+  fi
+  [ $failed = 0 ]
 }
 
 start_one() {
@@ -841,11 +870,15 @@ start_one() {
   local log; log="$STATE/$job-$(date '+%Y%m%d-%H%M%S').log"
   local keep=""; command -v caffeinate >/dev/null 2>&1 && keep="caffeinate -i"
   local rootlist=""; for r in "${ROOTS[@]}"; do rootlist="$rootlist$r"$'\n'; done
+  # set -m runs the offload in its own process group, so Ctrl-C in this window (to stop
+  # watching the progress bars, say) never reaches it. nohup covers a closed window or ssh.
+  set -m
   # shellcheck disable=SC2086
   DIT_RUN_PROJECT="$PROJECT" DIT_RUN_DAY="$DAY_ISO" DIT_RUN_ROOTS="$rootlist" DIT_RUN_CAM="$cam" \
     DIT_RUN_OVERNIGHT="$OVERNIGHT" DIT_RUN_COPY_MODE="$COPY_MODE" \
     nohup $keep "$SELF" _run "$job" "$type" "$card" > "$log" 2>&1 < /dev/null &
   echo $! > "$pidfile"
+  set +m
   echo "Started $job in the background. It keeps running if you disconnect."
 }
 
@@ -1362,7 +1395,7 @@ cmd_rehearse() {
   done
   echo "index" > "$cam/OTHER/INDEX.BIN"
   echo "Fake camera card created: FAKECAM (clips named Z...)"
-  ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --card FAKECAM ) || exit 1
+  ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --no-watch --card FAKECAM ) || exit 1
 
   if [ "$AUDIO_ENABLED" = yes ]; then
     make_fake_card FAKEAUDIO
@@ -1373,7 +1406,7 @@ cmd_rehearse() {
     done
     mkdir -p "$aud/250101_001$AUDIO_TAKE_SUFFIX"; echo old > "$aud/250101_001$AUDIO_TAKE_SUFFIX/250101_001_Tr1.WAV"
     echo "Fake audio card created: FAKEAUDIO (3 takes today, 1 old take)"
-    ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --card FAKEAUDIO ) || exit 1
+    ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --no-watch --card FAKEAUDIO ) || exit 1
   fi
 
   wait_for_jobs 90
