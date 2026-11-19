@@ -381,12 +381,13 @@ check "and the offload passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
 printf 'DESTINATIONS=("one")\nWATCH_ON_START="maybe"\n' > "$T/config.bad"
 check "a bad WATCH_ON_START is refused" 'DIT_OFFLOADER_CONFIG="$T/config.bad" "$TOOL" start P --to two 2>&1 | grep -q "WATCH_ON_START must be yes or no"'
 
+# A slow tee keeps an offload busy long enough to act on it part way.
+mkdir -p "$T/slowbin"
+printf '#!/bin/bash\nsleep 3\nexec "%s" "$@"\n' "$REAL_TEE" > "$T/slowbin/tee"
+chmod +x "$T/slowbin/tee"
 if command -v python3 >/dev/null 2>&1; then
   # Run start in a simulated terminal, press Ctrl-C while the bars show, and check that
-  # only the watching stops. A slow tee keeps the offload busy long enough.
-  mkdir -p "$T/slowbin"
-  printf '#!/bin/bash\nsleep 3\nexec "%s" "$@"\n' "$REAL_TEE" > "$T/slowbin/tee"
-  chmod +x "$T/slowbin/tee"
+  # only the watching stops.
   reset; sony_card "Untitled" A
   cat > "$T/press_ctrl_c.py" <<'PYTHON'
 import os, pty, select, sys, time
@@ -420,6 +421,54 @@ PYTHON
   settle
   check "and it finishes and passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
 fi
+
+echo "20. stop"
+check "stop with nothing running says so" '"$TOOL" stop --all | grep -q "No offloads are running"'
+check "stop of a job that is not running fails" '! "$TOOL" stop B >/dev/null 2>&1'
+check "stop needs a job" '! "$TOOL" stop 2>/dev/null'
+# Slow copy tools keep offloads busy long enough to stop them part way.
+REAL_CP="$(command -v cp)"
+mkdir -p "$T/slowcp"
+printf '#!/bin/bash\nsleep 4\nexec "%s" "$@"\n' "$REAL_CP" > "$T/slowcp/cp"
+chmod +x "$T/slowcp/cp"
+for mode in parallel staged; do
+  reset; sony_card "Untitled" A
+  cat > "$T/config" <<CFG
+DESTINATIONS=("one")
+COPY_MODE="$mode"
+CFG
+  if [ $mode = parallel ]; then slow="$T/slowbin"; else slow="$T/slowcp"; fi
+  PATH="$slow:$PATH" "$TOOL" start P --to two >/dev/null 2>&1
+  sleep 3
+  "$TOOL" stop A > "$T/stop.out" 2>&1
+  check "$mode: stop reports the job stopped" 'grep -q "Stopped CAMA" "$T/stop.out"'
+  check "$mode: nothing of the offload keeps running" '! pgrep -f "_run CAMA " >/dev/null'
+  check "$mode: status shows STOPPED" '"$TOOL" status 2>/dev/null | grep -q "CAMA: STOPPED"'
+  check "$mode: the log records the stop" 'grep -q "RESULT: STOPPED" "$T"/state/CAMA-*.log'
+  check "$mode: card stays mounted" '[ -d "$V/Untitled" ]'
+  check "$mode: eject refuses the stopped card" '! "$TOOL" eject A 2>/dev/null'
+  check "$mode: no half copy has a real name" '[ -z "$(find "$V/one" "$V/two" -name "*.MXF" -size -100k 2>/dev/null)" ]'
+  "$TOOL" start P --to two >/dev/null 2>&1; settle
+  check "$mode: starting it again passes" 'grep "RESULT:" "$(ls -t "$T"/state/CAMA-*.log | head -1)" | tail -1 | grep -q PASS'
+  check "$mode: and leaves no .dit-part files" '[ -z "$(find "$V/one" "$V/two" -name "*.dit-part")" ]'
+done
+for mode in staged parallel; do
+  reset; sony_card "Untitled" A
+  printf 'DESTINATIONS=("one")\nCOPY_MODE="%s"\nAUTO_EJECT="no"\n' $mode > "$T/config"
+  mkdir -p "$V/two/P/Footage/$ISO/CAMA/XDROOT/Clip"
+  echo "half a copy" > "$V/two/P/Footage/$ISO/CAMA/XDROOT/Clip/A001L001_x.MXF.dit-part"
+  "$TOOL" start P --to two >/dev/null 2>&1; settle
+  check "$mode: an unfinished copy from before is replaced" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log && cmp -s "$V/Untitled/XDROOT/Clip/A001L001_x.MXF" "$V/two/P/Footage/$ISO/CAMA/XDROOT/Clip/A001L001_x.MXF" && [ -z "$(find "$V/two" -name "*.dit-part")" ]'
+done
+reset; sony_card "Untitled" A; sony_card "Untitled 1" B
+cat > "$T/config" <<CFG
+DESTINATIONS=("one")
+COPY_MODE="parallel"
+CFG
+PATH="$T/slowbin:$PATH" "$TOOL" start P --to two >/dev/null 2>&1
+sleep 2
+"$TOOL" stop --all > "$T/stop.out" 2>&1
+check "stop --all stops every running offload" 'grep -q "Stopped CAMA" "$T/stop.out" && grep -q "Stopped CAMB" "$T/stop.out" && ! pgrep -f "dit-offloader _run" >/dev/null'
 
 echo
 if [ $fails = 0 ]; then echo "All tests passed."; else echo "$fails test(s) failed."; exit 1; fi

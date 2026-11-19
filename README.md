@@ -60,6 +60,7 @@ dit-offloader status --watch
 With `WATCH_ON_START="yes"` in the settings (or `start --watch`), `start` goes straight on
 to show the progress bars. Ctrl-C stops watching; the offloads keep running. That needs a
 terminal window: over SSH, connect first or use `ssh -t host dit-offloader start`.
+To stop an offload rather than the watching, use `dit-offloader stop`.
 
 While an offload runs, `status` shows a progress bar for each copy and each checksum,
 with speed and time left. `status --watch` updates those bars in place every 2 seconds
@@ -85,6 +86,7 @@ until the offloads finish (Ctrl-C stops watching; the offloads keep running):
 | `start [project]` | Offload every recognised card. Without a project name, uses `PROJECT` from the settings |
 | `status [--all] [--watch]` | Show progress bars and results (last 24 hours, or everything). `--watch` keeps the screen updated until the offloads finish |
 | `eject <job>` | Eject a passed card by hand, e.g. `eject A` or `eject AUDIO` |
+| `stop <job>` / `stop --all` | Stop a running offload, e.g. `stop A` or `stop AUDIO`. The card stays mounted and is not ejected; start it again to offload it |
 | `clear [--all]` | Clear finished offloads from `status`. Failed and interrupted ones stay unless you add `--all`. Their records move to `~/.local/state/dit-offloader/archive` |
 | `rehearse` | Practice run with fake cards. Accepts `--to`, `--parallel` and `--staged` |
 
@@ -133,7 +135,8 @@ See [examples](examples) for a complete settings file.
 ## How verification works
 
 Either way, a card passes only when every file read back from every destination matches
-the card's checksum.
+the card's checksum, and every file is written as `<name>.dit-part` and only gets its real
+name once complete, so a copy that is cut off never looks finished.
 
 **Staged** (`COPY_MODE="staged"`, the default):
 
@@ -147,7 +150,6 @@ the card's checksum.
   and checksummed on the way, so the card is never read twice.
 - Each copied file is checksummed on every destination as soon as it lands, while the
   next file copies.
-- Files are written as `<name>.dit-part` and only get their real name once complete.
 
 Parallel is usually faster with fast destinations (SSDs, RAIDs). It can be slower when
 several destinations share one spinning disk, because that disk then reads and writes at
@@ -183,8 +185,14 @@ Before copying, files that are already at a destination (from an earlier or inte
 run) are checked against the card. Matching ones are kept. If any differ, the offload
 stops and lists them, so you can move them aside.
 
-If an offload is stopped before it finishes (the Mac slept, lost power, or the process
-was killed), `status` shows it as `INTERRUPTED`. Do not erase that card; start it again.
+To stop an offload on purpose, run `dit-offloader stop A` (or `AUDIO`, or `--all`).
+`status` then shows it as `STOPPED`, and the card is not ejected.
+
+If an offload ends before it finishes for any other reason (the Mac slept, lost power, or
+the process was killed), `status` shows it as `INTERRUPTED`.
+
+Either way, do not erase that card; start it again. Any unfinished `.dit-part` copies on
+the destinations are replaced by the next run.
 
 ## Using it over SSH
 

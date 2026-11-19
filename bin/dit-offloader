@@ -5,7 +5,7 @@
 # Copies every card to all destinations, then re-reads the card and every copy and
 # compares checksums. It never deletes or overwrites a file.
 
-VERSION="0.3.1"
+VERSION="0.3.2"
 
 CONFIG="${DIT_OFFLOADER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dit-offloader/config}"
 STATE="${DIT_OFFLOADER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dit-offloader}"
@@ -56,6 +56,8 @@ dit-offloader $VERSION - verified camera and audio card offloads
                                           (project: from the settings file if not given)
   dit-offloader status [--all] [--watch]  show progress bars and results
   dit-offloader eject <job>               eject a card that passed (e.g. A or AUDIO)
+  dit-offloader stop <job>|--all          stop a running offload (e.g. A or AUDIO); the card
+                                          stays mounted and is not ejected
   dit-offloader clear [--all]             clear finished offloads from status
                                           (--all: failed and interrupted ones too)
   dit-offloader rehearse [options]        practice run with two small fake cards
@@ -284,11 +286,20 @@ build_plan() {
 
 # ---------- copying and checking ----------
 
+# Copy file $1 to $2 as $2.dit-part, renamed to $2 only once complete, so a copy that is
+# cut off (stopped, slept, power cut) never has a real name. An existing $2 is kept as it is:
+# it was checked against the card before copying started.
+copy_one() {
+  [ -e "$2" ] && return 0
+  mkdir -p "$(dirname "$2")"
+  rm -f "$2.dit-part"                 # an unfinished copy from an earlier run, never a real file
+  cp -p "$1" "$2.dit-part" && mv -n "$2.dit-part" "$2"
+}
+
 copy_from_card() {   # into folder $1
   local s r rc=0
   while IFS=$'\t' read -r s r; do
-    mkdir -p "$(dirname "$1/$r")"
-    cp -pn "$s" "$1/$r" || rc=1
+    copy_one "$s" "$1/$r" || rc=1
   done < "$PLAN"
   return $rc
 }
@@ -296,8 +307,7 @@ copy_from_card() {   # into folder $1
 copy_between() {     # from folder $1 into folder $2
   local s r rc=0
   while IFS=$'\t' read -r s r; do
-    mkdir -p "$(dirname "$2/$r")"
-    cp -pn "$1/$r" "$2/$r" || rc=1
+    copy_one "$1/$r" "$2/$r" || rc=1
   done < "$PLAN"
   return $rc
 }
@@ -704,7 +714,8 @@ CHECKSUM_FILE="list"
 
 # WATCH_ON_START: show the progress bars right after "start", as "status --watch" does.
 #   yes = start the offloads, then keep the progress bars on screen until they finish.
-#         Ctrl-C stops watching; the offloads keep running.
+#         Ctrl-C stops watching; the offloads keep running. To stop an offload:
+#         dit-offloader stop A   (or AUDIO, or --all)
 #   no  = start the offloads and return to the prompt (default)
 #   Needs a terminal window: over ssh, connect with ssh -t (or just "ssh host" and type the
 #   command). Override for one run with: start --watch   or   start --no-watch
@@ -1225,6 +1236,7 @@ watch_status() {
     screen="$(WATCHING=yes cmd_status "$@")"
     if [ "$(running_jobs)" -gt 0 ]; then
       screen="$screen"$'\n'"Updating every 2 seconds. Ctrl-C stops watching; the offloads keep running."
+      screen="$screen"$'\n'"To stop an offload: dit-offloader stop A (or AUDIO, or --all)"
     else
       screen="$screen"$'\n'"No offloads running."
     fi
@@ -1274,6 +1286,7 @@ cmd_status() {
     job="$(basename "$p" .pid)"
     log="$(job_log "$job")"
     if job_alive "$job"; then state="RUNNING"
+    elif [ -n "$log" ] && grep -q "RESULT: STOPPED" "$log"; then state="STOPPED"
     elif [ -n "$log" ] && grep -q "RESULT:" "$log"; then state="finished"
     else state="INTERRUPTED"; fi
     echo "===== $job: $state ====="
@@ -1302,11 +1315,77 @@ cmd_eject() {
     *) job="CAM$1" ;;
   esac
   log="$(job_log "$job")"
-  if [ -z "$log" ] || ! grep -q "RESULT: PASS" "$log"; then
+  if [ -z "$log" ] || ! grep "RESULT:" "$log" | tail -1 | grep -q "RESULT: PASS"; then
     die "$job has not passed verification; not ejecting"
   fi
   read -r src < "$STATE/$job.paths"
   diskutil eject "$src"
+}
+
+# Job names from what was typed: A -> CAMA, CAMA -> CAMA, audio -> AUDIO.
+job_name() {
+  case "$1" in
+    AUDIO|audio) echo AUDIO ;;
+    CAM*) echo "$1" ;;
+    *) echo "CAM$1" ;;
+  esac
+}
+
+# Process $1 and everything it started, deepest first.
+descendants() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do descendants "$c"; echo "$c"; done
+}
+
+# Stop running offloads. The card is left as it is and is not ejected; unfinished copies
+# stay as .dit-part files, which the next start of that card replaces.
+cmd_stop() {
+  local jobs=() j p pid pgid procs i log d card parts=0 n=0
+  case "$1" in
+    "") die "usage: dit-offloader stop <job>|--all   (for example A, CAMA or AUDIO)" ;;
+    --all)
+      for p in "$STATE"/*.pid; do
+        [ -f "$p" ] || continue
+        j="$(basename "$p" .pid)"; job_alive "$j" && jobs+=("$j")
+      done
+      [ ${#jobs[@]} -gt 0 ] || { echo "No offloads are running."; return 0; } ;;
+    *) jobs=("$(job_name "$1")") ;;
+  esac
+  for j in "${jobs[@]}"; do
+    if ! job_alive "$j"; then echo "$j is not running."; n=$((n + 1)); continue; fi
+    pid="$(cat "$STATE/$j.pid")"
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    if [ "$pgid" = "$pid" ]; then
+      kill -TERM -- "-$pgid" 2>/dev/null       # the offload's own process group: all of it
+    else
+      # Started by a version before 0.3.1, without its own group: its processes one by one.
+      procs="$(descendants "$pid") $pid"
+      # shellcheck disable=SC2086
+      kill -TERM $procs 2>/dev/null
+    fi
+    i=0
+    while job_alive "$j" && [ $i -lt 10 ]; do sleep 1; i=$((i + 1)); done
+    if job_alive "$j"; then
+      # shellcheck disable=SC2086
+      if [ "$pgid" = "$pid" ]; then kill -KILL -- "-$pgid" 2>/dev/null
+      else procs="$(descendants "$pid") $pid"; kill -KILL $procs 2>/dev/null; fi
+      sleep 1
+    fi
+    if job_alive "$j"; then echo "Could not stop $j (process $pid)."; n=$((n + 1)); continue; fi
+    log="$(job_log "$j")"
+    [ -z "$log" ] || say "RESULT: STOPPED - $j was stopped with dit-offloader stop. Do NOT erase this card; start it again." >> "$log"
+    parts=0
+    if [ -f "$STATE/$j.paths" ]; then
+      while IFS= read -r d; do
+        [ -d "$d" ] && parts=$((parts + $(find "$d" -name '*.dit-part' 2>/dev/null | wc -l)))
+      done < <(tail -n +2 "$STATE/$j.paths")
+    fi
+    card="$(head -1 "$STATE/$j.paths" 2>/dev/null)"
+    echo "Stopped $j. The card was not ejected. To offload it again: dit-offloader start --card \"${card##*/}\""
+    [ "$parts" = 0 ] ||
+      echo "  $parts unfinished cop$([ "$parts" = 1 ] && echo y || echo ies) left as .dit-part files on the destinations; the next start of this card replaces them."
+  done
+  [ $n = 0 ]
 }
 
 # Clear finished offloads from "status". Their records move to $STATE/archive/<time>/,
@@ -1432,6 +1511,7 @@ case "$1" in
   status)     shift; cmd_status "$@" ;;
   eject)      cmd_eject "$2" ;;
   clear)      cmd_clear "$2" ;;
+  stop)       cmd_stop "$2" ;;
   rehearse)   shift; cmd_rehearse "$@" ;;
   --version|-v|version) echo "dit-offloader $VERSION" ;;
   *)          usage ;;
