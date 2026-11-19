@@ -218,5 +218,155 @@ if command -v xxhsum >/dev/null 2>&1; then
   check "xxh128 checksum list saved" 'ls "$V/two/P/Footage/$ISO/CAMA"/dit-offloader_CAMA_*.xxh128 >/dev/null 2>&1'
 fi
 
+echo "14. parallel copying"
+reset; mkdir -p "$V/three/deep"
+cat > "$T/config" <<CFG
+DESTINATIONS=("one")
+VIDEO_MODE="clips"
+VIDEO_EXTENSIONS="mxf"
+CLIP_FOLDERS=("XDROOT/Clip")
+AUDIO_RENAME="yes"
+AUDIO_ROOMTONE="last"
+AUTO_EJECT="no"
+COPY_MODE="parallel"
+CFG
+sony_card "Untitled" A; audio_card "REC"
+touch -t 202001020304 "$V/Untitled/XDROOT/Clip/A001L001_x.MXF"
+"$TOOL" start P --to two --to "$V/three/deep" >/dev/null 2>&1; settle
+P1="P/Footage/$ISO/CAMA"
+check "both jobs pass" '[ "$(grep -l "RESULT: PASS" "$T"/state/*.log | wc -l)" -eq 2 ]'
+check "log says parallel" 'grep -q "Copying to all 3 destinations at once" "$T"/state/CAMA-*.log'
+check "clip on all three destinations" '[ -f "$V/one/$P1/A001L001_x.MXF" ] && [ -f "$V/two/$P1/A001L002_x.MXF" ] && [ -f "$V/three/deep/$P1/A001L001_x.MXF" ]'
+check "copies match the card" 'cmp -s "$V/Untitled/XDROOT/Clip/A001L001_x.MXF" "$V/three/deep/$P1/A001L001_x.MXF"'
+check "renamed audio on all three" '[ -f "$V/three/deep/P/Audio/$ISO/${TODAY}_010.TAKE/$ISO-P-RoomTone-TrL-R.WAV" ]'
+check "no partial files left" '[ -z "$(find "$V" -name "*.dit-part")" ]'
+check "modification date kept" '[ "$(find "$V/two/$P1/A001L001_x.MXF" -newermt "2020-01-03" | wc -l)" -eq 0 ]'
+check "cards left mounted with AUTO_EJECT=no" '[ -d "$V/Untitled" ] && [ -d "$V/REC" ]'
+
+reset; sony_card "Untitled" A
+"$TOOL" start P --to two --staged >/dev/null 2>&1; settle
+check "--staged overrides the settings" 'grep -q "Step 1/3" "$T"/state/CAMA-*.log'
+check "staged run passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+
+reset; sony_card "Untitled" A
+mkdir -p "$V/one/$P1"; cp "$V/Untitled/XDROOT/Clip/A001L001_x.MXF" "$V/one/$P1/"
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+check "matching copy kept in parallel mode" 'grep -q "1 copies are already at a destination and match" "$T"/state/CAMA-*.log'
+check "and the job passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+
+# A tee that damages one copy: the check of that copy must catch it.
+REAL_TEE="$(command -v tee)"; mkdir -p "$T/teebin"
+cat > "$T/teebin/tee" <<SHIM
+#!/bin/bash
+"$REAL_TEE" "\$@"; rc=\$?
+for last; do :; done
+echo X >> "\$last"
+exit \$rc
+SHIM
+chmod +x "$T/teebin/tee"
+reset; sony_card "Untitled" A
+PATH="$T/teebin:$PATH" "$TOOL" start P --to two >/dev/null 2>&1; settle
+check "damaged copy fails the job" 'grep -q "RESULT: FAIL" "$T"/state/CAMA-*.log'
+check "the damaged destination is named" 'grep -q "destination 2 does NOT match" "$T"/state/CAMA-*.log'
+check "card stays mounted" '[ -d "$V/Untitled" ]'
+
+echo "15. checksum files"
+reset; sony_card "Untitled" A
+cat > "$T/config" <<CFG
+DESTINATIONS=("one")
+VIDEO_MODE="clips"
+CLIP_FOLDERS=("XDROOT/Clip")
+CHECKSUM_FILE="mhl"
+CFG
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+M="$(find "$V/two/$P1" -maxdepth 1 -name "CAMA_*.mhl" | head -1)"
+check "classic MHL saved on each destination" '[ -n "$M" ] && ls "$V/one/$P1"/CAMA_*.mhl >/dev/null 2>&1'
+check "MHL lists every clip" '[ "$(grep -c "<md5>" "$M")" -eq 2 ]'
+check "MHL checksum is right" 'grep -q "<md5>$(md5 -q "$V/two/$P1/A001L001_x.MXF" 2>/dev/null || md5sum < "$V/two/$P1/A001L001_x.MXF" | cut -d" " -f1)</md5>" "$M"'
+check "MHL is well-formed XML" '! command -v xmllint >/dev/null || xmllint --noout "$M"'
+[ -z "$MHL11_XSD" ] || check "MHL matches the MHL 1.1 schema" 'xmllint --noout --schema "$MHL11_XSD" "$M" 2>/dev/null'
+check "no plain list with CHECKSUM_FILE=mhl" '! ls "$V/two/$P1"/dit-offloader_* >/dev/null 2>&1'
+echo 'HASH_ALGO="sha256"' >> "$T/config"
+check "classic MHL refuses sha256" '"$TOOL" start P --to two 2>&1 | grep -q "CHECKSUM_FILE=ascmhl"'
+
+if command -v xxhsum >/dev/null 2>&1; then
+  reset; sony_card "Untitled" A
+  sed -i.bak 's/^HASH_ALGO=.*/HASH_ALGO="xxh64"/' "$T/config"
+  "$TOOL" start P --to two >/dev/null 2>&1; settle
+  M="$(find "$V/one/$P1" -maxdepth 1 -name "CAMA_*.mhl" | head -1)"
+  check "xxh64 goes in MHL as xxhash64be" '[ "$(grep -c "<xxhash64be>" "$M")" -eq 2 ]'
+  [ -z "$MHL11_XSD" ] || check "xxh64 MHL matches the schema" 'xmllint --noout --schema "$MHL11_XSD" "$M" 2>/dev/null'
+
+  reset; sony_card "Untitled" A
+  sed -i.bak 's/^CHECKSUM_FILE=.*/CHECKSUM_FILE="ascmhl"/; s/^HASH_ALGO=.*/HASH_ALGO="xxh128"/' "$T/config"
+  echo 'COPY_MODE="parallel"' >> "$T/config"
+  "$TOOL" start P --to two >/dev/null 2>&1; settle
+  H="$V/two/$P1/ascmhl"
+  check "ASC MHL generation 1 saved" 'ls "$H"/0001_CAMA_*.mhl >/dev/null 2>&1'
+  check "ASC MHL chain saved" 'grep -q "sequencenr=\"1\"" "$H/ascmhl_chain.xml"'
+  check "ASC MHL lists every clip as original" '[ "$(grep -c "<xxh128 action=\"original\"" "$H"/0001_*.mhl)" -eq 2 ]'
+  # A second card from camera A on the same day lands in the same folder.
+  mkdir -p "$V/CARD2/XDROOT/Clip"; head -c 5000 /dev/urandom > "$V/CARD2/XDROOT/Clip/A002L001_x.MXF"
+  sleep 1
+  "$TOOL" start P --to two --card CARD2 >/dev/null 2>&1; settle
+  check "second offload adds generation 2" 'ls "$H"/0002_CAMA_*.mhl >/dev/null 2>&1 && grep -q "sequencenr=\"2\"" "$H/ascmhl_chain.xml"'
+  check "generation 1 left as it was" '[ "$(grep -c "<hash>" "$H"/0001_*.mhl)" -eq 2 ]'
+  if [ -n "$ASCMHL_XSD" ]; then
+    for g in "$H"/0001_*.mhl "$H"/0002_*.mhl; do
+      check "$(basename "$g") matches the ASC MHL schema" 'xmllint --noout --schema "$ASCMHL_XSD" "$g" 2>/dev/null'
+    done
+    check "chain matches the ASC MHL directory schema" 'xmllint --noout --schema "$ASCMHL_DIR_XSD" "$H/ascmhl_chain.xml" 2>/dev/null'
+  fi
+  if command -v ascmhl >/dev/null 2>&1; then
+    check "the ASC MHL reference tool verifies the history" 'ascmhl create -h xxh128 "$V/two/$P1" >/dev/null 2>&1 && ls "$H"/0003_*.mhl >/dev/null 2>&1 && ! grep -q "action=\"failed\"" "$H"/0003_*.mhl'
+  fi
+fi
+
+echo "16. clear"
+reset; sony_card "Untitled" A; sony_card "Untitled 1" B
+cat > "$T/config" <<CFG
+DESTINATIONS=("one")
+CFG
+mkdir -p "$V/two/P/Footage/$ISO/CAMB/XDROOT/Clip"; echo different > "$V/two/P/Footage/$ISO/CAMB/XDROOT/Clip/B001L001_x.MXF"
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+bash -c 'sleep 60; :' _run CAMQ camera Q & other=$!
+echo $other > "$T/state/CAMQ.pid"
+"$TOOL" clear > "$T/clear.out"
+check "passed job cleared" 'grep -q "Cleared CAMA (PASS)" "$T/clear.out" && ! "$TOOL" status | grep -q "CAMA:"'
+check "failed job kept" 'grep -q "CAMB(FAIL)" "$T/clear.out" && "$TOOL" status | grep -q "CAMB: finished"'
+check "running job kept" 'grep -q "Still running, not cleared: CAMQ" "$T/clear.out"'
+check "records moved to the archive" '[ -n "$(find "$T/state/archive" -name "CAMA-*.log")" ]'
+"$TOOL" clear --all >/dev/null
+check "--all clears the failed job" '! "$TOOL" status | grep -q "CAMB:"'
+kill $other 2>/dev/null; wait $other 2>/dev/null
+"$TOOL" clear --all >/dev/null
+check "nothing left says so" '"$TOOL" clear | grep -q "Nothing to clear"'
+
+echo "17. settings template"
+"$TOOL" init --print > "$T/template"
+for name in PROJECT DESTINATIONS MIN_DESTINATIONS VIDEO_PATH AUDIO_PATH DATE_FORMAT VIDEO_MODE \
+            VIDEO_EXTENSIONS CLIP_FOLDERS CAMERA_MARKERS CAM_SOURCE RENAME_CARD AUDIO_ENABLED \
+            AUDIO_TAKE_SUFFIX AUDIO_RENAME AUDIO_NAME AUDIO_TAKE_LABEL AUDIO_ROOMTONE AUDIO_TRACKS \
+            COPY_MODE HASH_ALGO CHECKSUM_FILE AUTO_EJECT; do
+  check "template describes $name" 'grep -Eq "^# ([A-Z_]+ and )?$name[ :]" "$T/template" && grep -q "^#\{0,1\}$name=" "$T/template"'
+done
+check "every setting in the template is one the tool reads" '[ -z "$(grep -o "^#\{0,1\}[A-Z_]*=" "$T/template" | tr -d "#=" | while read -r v; do grep -q "^$v=" "$TOOL" || echo "$v"; done)" ]'
+check "init --print does not create a file" '[ ! -e "$T/config.never" ] && DIT_OFFLOADER_CONFIG="$T/config.never" "$TOOL" init --print >/dev/null && [ ! -e "$T/config.never" ]'
+
+echo "18. progress bars in parallel mode"
+reset; mkdir -p "$T/state" "$V/two/P"
+head -c 1048576 /dev/zero > "$V/two/P/part.MXF"
+bash -c 'sleep 60; :' _run CAMQ camera Q & other=$!
+echo $other > "$T/state/CAMQ.pid"
+printf '%s\n%s\n%s\n' "$V/Q" "$V/one/P" "$V/two/P" > "$T/state/CAMQ.paths"
+printf 'dest\t1\t0\t2048\ndest\t2\t0\t2048\ntotal\t4096\nmode\tparallel\nstep\t1\t%s\n' "$(date +%s)" > "$T/state/CAMQ.progress"
+printf '1024\t1024\t%s\n' "$V/Q/clip.MXF" > "$T/state/CAMQ.hash-card"
+printf '1024\t1024\t%s\n' "$V/two/P/clip.MXF" > "$T/state/CAMQ.hash-dest2"
+LANG=C "$TOOL" status > "$T/status.out"
+kill $other 2>/dev/null; wait $other 2>/dev/null
+check "header says everything runs at once" 'grep -q "copying and checksumming at the same time" "$T/status.out"'
+check "second copy shows bytes arrived" 'grep -q "copy to destination 2 *#*\.* *5[0-9]%" "$T/status.out"'
+check "copy checksums run, not waiting" 'grep -q "checksum destination 2 *#*\.* *25%" "$T/status.out" && ! grep -q waiting "$T/status.out"'
+
 echo
 if [ $fails = 0 ]; then echo "All tests passed."; else echo "$fails test(s) failed."; exit 1; fi

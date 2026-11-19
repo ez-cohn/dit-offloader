@@ -5,7 +5,7 @@
 # Copies every card to all destinations, then re-reads the card and every copy and
 # compares checksums. It never deletes or overwrites a file.
 
-VERSION="0.2.3"
+VERSION="0.3.0"
 
 CONFIG="${DIT_OFFLOADER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dit-offloader/config}"
 STATE="${DIT_OFFLOADER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dit-offloader}"
@@ -38,6 +38,8 @@ AUDIO_ROOMTONE="none"
 AUDIO_TRACKS=""
 AUTO_EJECT="yes"
 HASH_ALGO="md5"
+COPY_MODE="staged"
+CHECKSUM_FILE="list"
 
 say() { echo "$(date '+%H:%M:%S')  $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -46,14 +48,17 @@ usage() {
   cat <<USAGE
 dit-offloader $VERSION - verified camera and audio card offloads
 
-  dit-offloader init                      create the settings file
+  dit-offloader init [--print]            create the settings file (--print: show it instead)
   dit-offloader config                    show the settings in use
   dit-offloader list                      show mounted drives and recognised cards
   dit-offloader start [project] [options] offload every recognised card
                                           (project: from the settings file if not given)
   dit-offloader status [--all] [--watch]  show progress bars and results
   dit-offloader eject <job>               eject a card that passed (e.g. A or AUDIO)
-  dit-offloader rehearse [--to <drive>]   practice run with two small fake cards
+  dit-offloader clear [--all]             clear finished offloads from status
+                                          (--all: failed and interrupted ones too)
+  dit-offloader rehearse [options]        practice run with two small fake cards
+                                          (accepts --to, --parallel and --staged)
 
 Options for start:
   --to <drive>       extra destination for this run (drive name or full path); repeatable
@@ -61,6 +66,9 @@ Options for start:
   --cam <id>         camera id for that card, instead of working it out
   --day YYYY-MM-DD   shoot day, if it is not today
   --overnight        also take audio takes dated the day after the shoot day
+  --parallel         copy to every destination and checksum at the same time
+  --staged           copy and checksum one stage after another
+                     (both override COPY_MODE in the settings file)
 
 Settings file: $CONFIG
 USAGE
@@ -78,6 +86,19 @@ load_config() {
     *) die "HASH_ALGO must be md5, sha1, sha256, xxh64 or xxh128" ;;
   esac
   case "$AUDIO_ROOMTONE" in last|none) ;; *) die "AUDIO_ROOMTONE must be last or none" ;; esac
+  case "$COPY_MODE" in staged|parallel) ;; *) die "COPY_MODE must be staged or parallel" ;; esac
+  case "$CHECKSUM_FILE" in
+    list|none) ;;
+    mhl)
+      case "$HASH_ALGO" in md5|sha1|xxh64) ;;
+        *) die "CHECKSUM_FILE=mhl (classic MHL) only supports HASH_ALGO md5, sha1 or xxh64. For $HASH_ALGO use CHECKSUM_FILE=ascmhl" ;;
+      esac ;;
+    ascmhl)
+      case "$HASH_ALGO" in md5|sha1|xxh64|xxh128) ;;
+        *) die "CHECKSUM_FILE=ascmhl supports HASH_ALGO md5, sha1, xxh64 or xxh128, not $HASH_ALGO" ;;
+      esac ;;
+    *) die "CHECKSUM_FILE must be list, mhl, ascmhl or none" ;;
+  esac
 }
 
 need_mac() {
@@ -94,6 +115,43 @@ hash_of() {
     xxh64)  [ -r "$1" ] && xxhsum -H1 < "$1" 2>/dev/null | cut -d' ' -f1 ;;
     xxh128) [ -r "$1" ] && xxhsum -H2 < "$1" 2>/dev/null | cut -d' ' -f1 ;;
   esac
+}
+
+# Checksum of whatever arrives on standard input (used while copying in parallel mode).
+hash_stdin() {
+  case "$HASH_ALGO" in
+    md5)
+      if command -v md5 >/dev/null 2>&1; then md5 -q
+      else md5sum | cut -d' ' -f1; fi ;;
+    sha1)   shasum -a 1 | cut -d' ' -f1 ;;
+    sha256) shasum -a 256 | cut -d' ' -f1 ;;
+    xxh64)  xxhsum -H1 | cut -d' ' -f1 ;;
+    xxh128) xxhsum -H2 | cut -d' ' -f1 ;;
+  esac
+}
+
+# Size in bytes and modification time (seconds since 1970) of file $1: "<size> <mtime>".
+file_stat() {
+  # GNU stat first: on Linux "stat -f" means something else and does not fail.
+  stat -c '%s %Y' "$1" 2>/dev/null || stat -f '%z %m' "$1" 2>/dev/null
+}
+
+iso_utc() {          # seconds since 1970 -> 2026-11-19T14:05:12Z
+  date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+xml_escape() {        # sed, because "&" in bash replacements differs between versions
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+}
+
+# C4 id of file $1 (SHA-512 written in base 58), as ASC MHL uses for its chain file.
+c4_of() {
+  local hex
+  hex="$(shasum -a 512 "$1" | cut -d' ' -f1 | tr 'a-f' 'A-F')"
+  printf 'ibase=16\nh=%s\nibase=A\nwhile (h > 0) { h %% 58; h = h / 58 }\n' "$hex" | BC_LINE_LENGTH=0 bc |
+    awk 'BEGIN { c = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" }
+         { s = substr(c, $1 + 1, 1) s }
+         END { while (length(s) < 88) s = "1" s; print "c4" s }'
 }
 
 # Format the shoot day ($DAY_ISO, YYYY-MM-DD) with a strftime pattern.
@@ -265,6 +323,169 @@ hash_dest() {        # checksums of the copies in folder $1, into file $2
   } < <(paste "$SIZES" "$PLAN") | sort > "$2"
 }
 
+# ---------- parallel mode: one read of the card, every destination at once ----------
+
+# Copy every file in the plan to all destinations in $@ at the same time, reading the card
+# once and checksumming what is read. Card checksums go to $CARD_LIST; each finished file
+# is noted in $COPIED, so the destination checks can follow right behind.
+copy_parallel() {
+  local k s r d h rc sofar=0 idx=0 outs
+  : > "$CARD_LIST.unsorted"
+  while IFS=$'\t' read -r k s r; do
+    idx=$((idx + 1))
+    printf '%s\t%s\t%s\n' "$sofar" "$k" "$s" > "$STATE/$JOB.hash-card"
+    outs=()
+    for d in "$@"; do
+      [ -e "$d/$r" ] && continue        # a matching copy from an earlier run: kept
+      mkdir -p "$(dirname "$d/$r")"
+      outs+=("$d/$r.dit-part")
+    done
+    if [ ${#outs[@]} -gt 0 ]; then
+      # tee writes the card's bytes to every destination and passes them on to the checksum.
+      h="$(tee "${outs[@]}" < "$s" | hash_stdin; exit "${PIPESTATUS[0]}")"; rc=$?
+      if [ $rc = 0 ] && [ -n "$h" ]; then
+        for d in "${outs[@]}"; do
+          # Only a complete copy gets its real name; nothing existing is replaced.
+          mv -n "$d" "${d%.dit-part}" && touch -r "$s" "${d%.dit-part}"
+        done
+      else
+        say "  copy error on $r: left as .dit-part and treated as missing"
+        h="COPYERROR"
+      fi
+    else
+      h="$(hash_of "$s")"
+    fi
+    printf '%s  %s\n' "${h:-UNREADABLE}" "$r" >> "$CARD_LIST.unsorted"
+    echo "$idx" >> "$COPIED"
+    sofar=$((sofar + k))
+  done < <(paste "$SIZES" "$PLAN")
+  printf '%s\t0\t\n' "$sofar" > "$STATE/$JOB.hash-card"
+  sort "$CARD_LIST.unsorted" > "$CARD_LIST"
+}
+
+# Checksum the copies in folder $1 as they arrive, into file $2, progress in file $3.
+hash_following() {
+  local s r h k sofar=0 idx=0
+  {
+    while IFS=$'\t' read -r k s r; do
+      idx=$((idx + 1))
+      until [ "$(wc -l < "$COPIED" | tr -d ' ')" -ge $idx ] || [ -e "$COPIED.done" ]; do sleep 1; done
+      printf '%s\t%s\t%s\n' "$sofar" "$k" "$1/$r" > "$3"
+      h="$(hash_of "$1/$r")"; printf '%s  %s\n' "${h:-MISSING}" "$r"
+      sofar=$((sofar + k))
+    done
+    printf '%s\t0\t\n' "$sofar" > "$3"
+  } < <(paste "$SIZES" "$PLAN") | sort > "$2"
+}
+
+# ---------- checksum files saved with the copies ----------
+
+hash_name() {        # element name for $HASH_ALGO in classic MHL and in ASC MHL
+  case "$1:$HASH_ALGO" in
+    mhl:xxh64) echo xxhash64be ;;
+    *) echo "$HASH_ALGO" ;;
+  esac
+}
+
+# Plain list, as before: "<checksum>  <path>" lines.
+write_list() {       # destination folder, verified list, stamp
+  local f="$1/dit-offloader_${JOB}_$3.$HASH_ALGO"
+  cp -n "$2" "$f" 2>/dev/null && echo "$f"
+}
+
+# Classic MHL (version 1.1), the format OffShoot, Silverstack and the mhl tool read.
+write_mhl() {        # destination folder, verified list, start, finish
+  local dir="$1" f h r size mtime el now line
+  f="$dir/$(basename "$dir")_$(date '+%Y-%m-%d_%H%M%S').mhl"
+  [ ! -e "$f" ] || return 1
+  el="$(hash_name mhl)"; now="$(iso_utc "$4")"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<hashlist version="1.1">'
+    echo '  <creatorinfo>'
+    echo "    <username>$(xml_escape "${USER:-unknown}")</username>"
+    echo "    <hostname>$(xml_escape "$(hostname -s)")</hostname>"
+    echo "    <tool>dit-offloader $VERSION</tool>"
+    echo "    <source>$(xml_escape "$SRC")</source>"
+    echo "    <startdate>$(iso_utc "$3")</startdate>"
+    echo "    <finishdate>$now</finishdate>"
+    echo '  </creatorinfo>'
+    while IFS= read -r line; do
+      h="${line%%  *}"; r="${line#*  }"
+      read -r size mtime <<< "$(file_stat "$dir/$r")"
+      echo '  <hash>'
+      echo "    <file>$(xml_escape "$r")</file>"
+      echo "    <size>${size:-0}</size>"
+      echo "    <lastmodificationdate>$(iso_utc "${mtime:-0}")</lastmodificationdate>"
+      echo "    <$el>$h</$el>"
+      echo "    <hashdate>$now</hashdate>"
+      echo '  </hash>'
+    done < "$2"
+    echo '</hashlist>'
+  } > "$f" && echo "$f"
+}
+
+# ASC MHL (version 2.0): a new generation in the folder's ascmhl history, plus the chain file.
+write_ascmhl() {     # destination folder, verified list, start, finish
+  local dir="$1" hist="$1/ascmhl" seq=0 n g f chain h r size mtime action now esc line
+  mkdir -p "$hist" || return 1
+  for g in "$hist"/[0-9][0-9][0-9][0-9]_*.mhl; do
+    [ -e "$g" ] || continue
+    n="$(basename "$g")"; n=$((10#${n%%_*}))
+    [ "$n" -le "$seq" ] || seq=$n
+  done
+  seq=$((seq + 1))
+  f="$hist/$(printf '%04d' "$seq")_$(basename "$dir")_$(date -u '+%Y-%m-%d_%H%M%SZ').mhl"
+  [ ! -e "$f" ] || return 1
+  now="$(iso_utc "$4")"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<hashlist version="2.0" xmlns="urn:ASC:MHL:v2.0">'
+    echo '  <creatorinfo>'
+    echo "    <creationdate>$now</creationdate>"
+    echo "    <hostname>$(xml_escape "$(hostname -s)")</hostname>"
+    echo "    <tool version=\"$VERSION\">dit-offloader</tool>"
+    echo '  </creatorinfo>'
+    echo '  <processinfo>'
+    echo '    <process>transfer</process>'
+    echo '    <ignore>'
+    echo '      <pattern>.DS_Store</pattern>'
+    echo '      <pattern>ascmhl</pattern>'
+    echo '      <pattern>ascmhl/</pattern>'
+    echo '    </ignore>'
+    echo '  </processinfo>'
+    echo '  <hashes>'
+    while IFS= read -r line; do
+      h="${line%%  *}"; r="${line#*  }"; esc="$(xml_escape "$r")"
+      read -r size mtime <<< "$(file_stat "$dir/$r")"
+      action=original
+      [ $seq = 1 ] || ! grep -qF ">$esc</path>" "$hist"/[0-9][0-9][0-9][0-9]_*.mhl 2>/dev/null || action=verified
+      echo '    <hash>'
+      echo "      <path size=\"${size:-0}\" lastmodificationdate=\"$(iso_utc "${mtime:-0}")\">$esc</path>"
+      echo "      <$(hash_name ascmhl) action=\"$action\" hashdate=\"$now\">$h</$(hash_name ascmhl)>"
+      echo '    </hash>'
+    done < "$2"
+    echo '  </hashes>'
+    echo '</hashlist>'
+  } > "$f" || return 1
+  # The chain file lists every generation with a fingerprint of it. Rewritten whole, via a
+  # temporary file, so an interruption never leaves it half written.
+  chain="$hist/ascmhl_chain.xml"
+  {
+    if [ -f "$chain" ]; then
+      grep -v '</ascmhldirectory>' "$chain"
+    else
+      echo '<?xml version="1.0" encoding="UTF-8"?>'
+      echo '<ascmhldirectory xmlns="urn:ASC:MHL:DIRECTORY:v2.0">'
+    fi
+    echo "  <hashlist sequencenr=\"$seq\">"
+    echo "    <path>$(xml_escape "$(basename "$f")")</path>"
+    echo "    <c4>$(c4_of "$f")</c4>"
+    echo '  </hashlist>'
+    echo '</ascmhldirectory>'
+  } > "$chain.tmp" && mv "$chain.tmp" "$chain" && echo "$f"
+}
+
 free_kb() {
   local a; a="$(df -Pk "$1" 2>/dev/null | tail -1 | awk '{print $4}')"
   case "$a" in ''|*[!0-9]*) echo "" ;; *) echo "$a" ;; esac
@@ -311,78 +532,187 @@ unlock_space() { rmdir "$STATE/space.lock" 2>/dev/null; }
 
 # ---------- commands ----------
 
-cmd_init() {
-  [ ! -e "$CONFIG" ] || die "$CONFIG already exists; edit it, or delete it to start over"
-  mkdir -p "$(dirname "$CONFIG")"
-  cat > "$CONFIG" <<'TEMPLATE'
-# dit-offloader settings. Lines starting with # are notes.
+config_template() {
+  cat <<'TEMPLATE'
+# dit-offloader settings
+#
+# Lines starting with # are notes; dit-offloader ignores them. Each setting below shows
+# the values it accepts and its default (what dit-offloader uses if the line is missing).
+# Put text values in quotes. Lists go in round brackets, one quoted item each, separated by
+# spaces, not commas: ("Drive 1" "Drive 2").
+# Check what is in use with: dit-offloader config
 
-# Project name used by "start" when you don't give one: dit-offloader start
-# A name given on the command line wins: dit-offloader start OtherProject
+
+# ===== Project and destinations =====
+
+# PROJECT: the project name used when you run "dit-offloader start" without one.
+#   Any name without a slash. A name typed after "start" wins over this one.
+#   Default: none, so "start" needs a name.
+#   Example: PROJECT="Gemes2"
 #PROJECT="MyProject"
 
-# Where every offload goes: drive names (as shown in Finder) or full folder paths.
-# Add more for a single run with:  dit-offloader start <project> --to "<drive>"
+# DESTINATIONS: where every offload goes.
+#   A list of drive names as Finder shows them, or full folder paths, or a mix.
+#   Add more for one run with: dit-offloader start --to "Other Drive"
+#   Default: none.
+#   Examples: DESTINATIONS=("BackupA")
+#             DESTINATIONS=("BackupA" "BackupB" "/Volumes/RAID/Dailies")
 DESTINATIONS=("MyBackupDrive")
 
-# Refuse to start with fewer destinations than this.
+# MIN_DESTINATIONS: refuse to start with fewer destinations than this, counting --to ones.
+#   A whole number, 1 or more. Default: 2.
 MIN_DESTINATIONS=2
 
-# Folder layout inside each destination.
-#   {project} = the name you give to "start"   {date} = shoot day   {cam} = camera id
+
+# ===== Folder layout =====
+
+# VIDEO_PATH and AUDIO_PATH: the folders created inside each destination.
+#   Placeholders:  {project} = project name   {date} = shoot day (see DATE_FORMAT)
+#                  {cam} = camera id (video only), e.g. A
+#   Use / between folder levels.
+#   Defaults: VIDEO_PATH='{project}/Footage/{date}/CAM{cam}'
+#             AUDIO_PATH='{project}/Audio/{date}'
+#   Example:  VIDEO_PATH='{project}-Media/11-Footage/{date}/CAM{cam}'
 VIDEO_PATH='{project}/Footage/{date}/CAM{cam}'
 AUDIO_PATH='{project}/Audio/{date}'
 
-# How {date} is written. %Y-%m-%d gives 2026-11-16, %y%m%d gives 261116.
+# DATE_FORMAT: how {date} is written, using date codes.
+#   %Y = 2026   %y = 26   %m = 11   %d = 19   %b = Nov
+#   Examples: '%Y-%m-%d' gives 2026-11-19 (default)
+#             '%y%m%d'   gives 261119
+#             '%Y%m%d'   gives 20261119
 DATE_FORMAT='%Y-%m-%d'
 
-# full  = copy the whole card, keeping its folder structure (safest)
-# clips = copy only the video clips, all into one folder
+
+# ===== Camera cards =====
+
+# VIDEO_MODE: what is copied from a camera card.
+#   full  = the whole card, keeping its folder structure. Safest; some software needs the
+#           card's other files to read the clips. (default)
+#   clips = only the video clips, all in one folder, without the card's folder structure.
 VIDEO_MODE="full"
 
-# What counts as a video clip.
+# VIDEO_EXTENSIONS: which files count as video clips, separated by spaces, without dots.
+#   Used to find the camera id, and to choose the files when VIDEO_MODE="clips".
+#   Upper and lower case are treated the same.
+#   Default: "mxf mp4 mov braw r3d crm mts"
 VIDEO_EXTENSIONS="mxf mp4 mov braw r3d crm mts"
 
-# Folders on the card that hold the clips. Empty means search the whole card.
-# Example for Sony XDCAM cards: CLIP_FOLDERS=("XDROOT/Clip")
+# CLIP_FOLDERS: folders on the card where the clips are, relative to the card's top level.
+#   A list. Empty () searches the whole card. Default: ()
+#   Examples: Sony XDCAM: ("XDROOT/Clip")       Sony XAVC: ("PRIVATE/M4ROOT/CLIP")
+#             Canon:      ("CONTENTS/CLIPS001")  Panasonic: ("CONTENTS/VIDEO")
 CLIP_FOLDERS=()
 
-# A drive is treated as a camera card when one of these exists on it.
+# CAMERA_MARKERS: a drive counts as a camera card when one of these exists on it.
+#   A list of folders or files, relative to the card's top level.
+#   Default: ("XDROOT/Clip" "PRIVATE/M4ROOT/CLIP" "CONTENTS/CLIPS001" "CONTENTS/VIDEO" "PRIVATE/AVCHD" "DCIM")
+#   A card that is not recognised can still be offloaded with: start --card "<name>"
 CAMERA_MARKERS=("XDROOT/Clip" "PRIVATE/M4ROOT/CLIP" "CONTENTS/CLIPS001" "CONTENTS/VIDEO" "PRIVATE/AVCHD" "DCIM")
 
-# Where the camera id comes from:
-#   filename = the first character of the clip names (A001C001.MXF is camera A)
-#   volume   = the card's drive name
+# CAM_SOURCE: where the camera id ({cam}, and the job name such as CAMA) comes from.
+#   filename = the first character of the clip names: A001C001.MXF is camera A. (default)
+#              All clips on a card must start with the same character.
+#   volume   = the card's drive name. Name your cards A, B, C... before offloading.
+#   For one card you can also give it yourself: start --card "<name>" --cam B
 CAM_SOURCE="filename"
 
-# yes = rename the card's drive to its camera id before copying.
+# RENAME_CARD: rename the card's drive to its camera id before copying.
+#   yes = rename (the only change ever made to a card)
+#   no  = leave the name alone (default)
 RENAME_CARD="no"
 
-# Audio cards: recorders that write one folder per take, named YYMMDD_NNN plus a suffix.
+
+# ===== Audio cards =====
+
+# AUDIO_ENABLED: look for audio cards.
+#   yes = a drive with take folders (see AUDIO_TAKE_SUFFIX) is offloaded as audio (default)
+#   no  = audio cards are not recognised
 AUDIO_ENABLED="yes"
+
+# AUDIO_TAKE_SUFFIX: the ending of the recorder's take folders, which are named
+#   YYMMDD_NNN plus this ending, e.g. 261119_001.TAKE.
+#   Default: ".TAKE"
+#   Only takes dated the shoot day are copied (add --overnight for the day after too).
 AUDIO_TAKE_SUFFIX=".TAKE"
 
-# yes = rename audio files on the copies (the card is never changed).
-#   261116_001_Tr1.WAV becomes AUDIO_NAME with:
-#   {date} {project} {take} = take label   {track} = track name
+# AUDIO_RENAME: rename the audio files on the copies. The card itself is never changed.
+#   yes = rename using AUDIO_NAME, AUDIO_TAKE_LABEL, AUDIO_ROOMTONE and AUDIO_TRACKS
+#   no  = keep the recorder's names (default)
 AUDIO_RENAME="no"
+
+# AUDIO_NAME: the new file name, without the extension, when AUDIO_RENAME="yes".
+#   Placeholders: {date} = shoot day   {project} = project name
+#                 {take} = take label (see AUDIO_TAKE_LABEL)   {track} = track name
+#   Default: '{date}-{project}-{take}-{track}'
+#   Example: 261119_001_Tr1.WAV becomes 261119-Gemes2-Tk01-Tr1-OH.WAV
 AUDIO_NAME='{date}-{project}-{take}-{track}'
+
+# AUDIO_TAKE_LABEL: how {take} is written from the take number.
+#   %02d is the number with at least 2 digits, %03d with 3, %d as it is.
+#   Examples: 'Tk%02d' gives Tk01 (default)   'Take%d' gives Take1   'T%03d' gives T001
 AUDIO_TAKE_LABEL='Tk%02d'
 
-# last = label the last take of the day RoomTone (needs at least two takes). none = off.
+# AUDIO_ROOMTONE: label one take RoomTone instead of a take number.
+#   last = the day's last take is RoomTone, when there are at least two takes
+#   none = no RoomTone label (default)
 AUDIO_ROOMTONE="none"
 
-# Friendlier track names: <name on the recorder>=<name you want>, separated by spaces.
-# Example: AUDIO_TRACKS="Tr1=Tr1-Boom Tr2=Tr2-Lav TrL_R=TrLR-Mix"
+# AUDIO_TRACKS: friendlier track names, as <recorder's name>=<name you want>, separated by
+#   spaces. The recorder's name is the part of the file name after the take number.
+#   Tracks not listed keep their name, with _ changed to -.
+#   Default: "" (no changes)
+#   Example: AUDIO_TRACKS="Tr1=Tr1-Boom Tr2=Tr2-Lav TrL_R=TrLR-Mix"
 AUDIO_TRACKS=""
 
-# Eject a card once every copy has been verified.
-AUTO_EJECT="yes"
 
-# Checksum used for verification: md5, sha1, sha256, xxh64 or xxh128.
-# xxh64 and xxh128 are much faster on large cards and need xxhsum (brew install xxhash).
+# ===== Copying and checking =====
+
+# COPY_MODE: how copying and checksumming are scheduled. Every copy is checked either way.
+#   staged   = one stage after another: card to destination 1; then destination 1 to the
+#              others while the card is checksummed; then every copy is checksummed. (default)
+#   parallel = the card is read once and written to every destination at the same time,
+#              checksummed in that same read, and each copy is checksummed as soon as it
+#              lands while the next file copies. Usually faster with fast destinations
+#              (SSDs, RAIDs); can be slower when several destinations share one spinning
+#              disk. Creation dates of the copies are the copy time (modification dates are
+#              kept).
+#   Override for one run with: start --parallel   or   start --staged
+COPY_MODE="staged"
+
+# HASH_ALGO: the checksum used to compare the card with every copy.
+#   md5    = the most widely supported (default)
+#   sha1   = widely supported
+#   sha256 = slower; sometimes required for archives
+#   xxh64  = very fast; needs xxhsum (brew install xxhash)
+#   xxh128 = very fast, the usual choice for large cards; needs xxhsum
 HASH_ALGO="md5"
+
+# CHECKSUM_FILE: the record of checksums saved next to the copies on every destination.
+#   list   = a plain text list, dit-offloader_<job>_<time>.<algorithm> (default)
+#   mhl    = a classic Media Hash List, <folder>_<date>_<time>.mhl, as OffShoot and
+#            Silverstack write. Works with HASH_ALGO md5, sha1 or xxh64 only.
+#   ascmhl = an ASC MHL history: an "ascmhl" folder that gains a new entry with each
+#            offload into the same folder. Works with md5, sha1, xxh64 or xxh128.
+#   none   = no file (the checksums are still kept in the logs)
+CHECKSUM_FILE="list"
+
+# AUTO_EJECT: eject a card once every copy has been verified.
+#   yes = eject (default). A card that is still mounted afterwards has not passed.
+#   no  = leave it mounted; eject later with: dit-offloader eject A
+AUTO_EJECT="yes"
 TEMPLATE
+}
+
+cmd_init() {
+  case "$1" in
+    --print) config_template; return ;;
+    "") ;;
+    *) die "usage: dit-offloader init [--print]" ;;
+  esac
+  [ ! -e "$CONFIG" ] || die "$CONFIG already exists; edit it, or delete it to start over. To see every setting described: dit-offloader init --print"
+  mkdir -p "$(dirname "$CONFIG")"
+  config_template > "$CONFIG"
   echo "Created $CONFIG"
   echo "Open it and set DESTINATIONS, then try: dit-offloader rehearse"
 }
@@ -445,6 +775,8 @@ cmd_start() {
       --cam)  [ -n "$2" ] || die "--cam needs a camera id"; cam="$2"; shift 2 ;;
       --day)  [ -n "$2" ] || die "--day needs a date"; DAY_ISO="$2"; shift 2 ;;
       --overnight) OVERNIGHT=yes; shift ;;
+      --parallel) COPY_MODE=parallel; shift ;;
+      --staged)   COPY_MODE=staged; shift ;;
       -*)     die "unknown option $1 (see: dit-offloader --help)" ;;
       *)      [ -z "$project" ] || die "unexpected extra word \"$1\" (drives go after --to)"; project="$1"; shift ;;
     esac
@@ -455,7 +787,7 @@ cmd_start() {
   [ -z "$cam" ] || [ -n "$card" ] || die "--cam needs --card, so it is clear which card it is for"
   DATE_LABEL="$(fmt_day "$DATE_FORMAT")" || die "could not understand the day \"$DAY_ISO\" (use YYYY-MM-DD)"
   resolve_destinations
-  echo "Project: $PROJECT   Day: $DATE_LABEL   Destinations: ${#ROOTS[@]}"
+  echo "Project: $PROJECT   Day: $DATE_LABEL   Destinations: ${#ROOTS[@]}   Copying: $COPY_MODE"
   for v in "${ROOTS[@]}"; do echo "  $v"; done
 
   if [ -n "$card" ]; then start_one "$card" "$cam"; return; fi
@@ -511,7 +843,7 @@ start_one() {
   local rootlist=""; for r in "${ROOTS[@]}"; do rootlist="$rootlist$r"$'\n'; done
   # shellcheck disable=SC2086
   DIT_RUN_PROJECT="$PROJECT" DIT_RUN_DAY="$DAY_ISO" DIT_RUN_ROOTS="$rootlist" DIT_RUN_CAM="$cam" \
-    DIT_RUN_OVERNIGHT="$OVERNIGHT" \
+    DIT_RUN_OVERNIGHT="$OVERNIGHT" DIT_RUN_COPY_MODE="$COPY_MODE" \
     nohup $keep "$SELF" _run "$job" "$type" "$card" > "$log" 2>&1 < /dev/null &
   echo $! > "$pidfile"
   echo "Started $job in the background. It keeps running if you disconnect."
@@ -628,39 +960,61 @@ cmd_run() {
     base="$(du -sk "$d" 2>/dev/null | cut -f1)"
     printf 'dest\t%s\t%s\t%s\n' "$i" "${base:-0}" "$(sed -n "${i}p" "$work/space-mine.txt" | cut -f2)"
   done > "$work/progress"
-  printf 'total\t%s\n' "$kb" >> "$work/progress"
+  local mode="${DIT_RUN_COPY_MODE:-$COPY_MODE}"
+  printf 'total\t%s\nmode\t%s\n' "$kb" "$mode" >> "$work/progress"
   mv "$work/progress" "$STATE/$job.progress"
 
-  printf 'step\t1\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
-  say "Step 1/3: copying the card to destination 1"
-  copy_from_card "${dests[0]}" || say "  note: cp reported a problem; verification will show if it matters"
+  local pids=() started; started="$(date +%s)"
+  SRC="$src"
+  if [ "$mode" = parallel ]; then
+    printf 'step\t1\t%s\n' "$started" >> "$STATE/$job.progress"
+    say "Copying to all $n destinations at once; the card is checksummed in the same read"
+    say "  and each copy is checksummed as soon as it lands"
+    JOB="$job"; COPIED="$work/copied"; CARD_LIST="$work/card.$HASH_ALGO"
+    : > "$COPIED"
+    i=0
+    while [ $i -lt "$n" ]; do
+      hash_following "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" "$STATE/$job.hash-dest$((i + 1))" &
+      pids+=($!)
+      i=$((i + 1))
+    done
+    copy_parallel "${dests[@]}"
+    touch "$COPIED.done"
+    printf 'step\t2\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
+    say "Copies done; finishing the checksums of the copies"
+    for k in "${pids[@]}"; do wait "$k"; done
+  else
+    printf 'step\t1\t%s\n' "$started" >> "$STATE/$job.progress"
+    say "Step 1/3: copying the card to destination 1"
+    copy_from_card "${dests[0]}" || say "  note: cp reported a problem; verification will show if it matters"
 
-  printf 'step\t2\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
-  say "Step 2/3: copying destination 1 to the other destinations, and checksumming the card"
-  local pids=()
-  i=1
-  while [ $i -lt "$n" ]; do
-    ( copy_between "${dests[0]}" "${dests[$i]}" ||
-        echo "$(date '+%H:%M:%S')    note: cp to destination $((i + 1)) reported a problem" ) &
-    pids+=($!)
-    i=$((i + 1))
-  done
-  hash_card "$work/card.$HASH_ALGO" "$STATE/$job.hash-card"
-  for k in "${pids[@]}"; do wait "$k"; done
+    printf 'step\t2\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
+    say "Step 2/3: copying destination 1 to the other destinations, and checksumming the card"
+    i=1
+    while [ $i -lt "$n" ]; do
+      ( copy_between "${dests[0]}" "${dests[$i]}" ||
+          echo "$(date '+%H:%M:%S')    note: cp to destination $((i + 1)) reported a problem" ) &
+      pids+=($!)
+      i=$((i + 1))
+    done
+    hash_card "$work/card.$HASH_ALGO" "$STATE/$job.hash-card"
+    for k in "${pids[@]}"; do wait "$k"; done
 
-  printf 'step\t3\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
-  say "Step 3/3: checksumming every copy"
-  pids=()
-  i=0
-  while [ $i -lt "$n" ]; do
-    hash_dest "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" "$STATE/$job.hash-dest$((i + 1))" &
-    pids+=($!)
-    i=$((i + 1))
-  done
-  for k in "${pids[@]}"; do wait "$k"; done
+    printf 'step\t3\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
+    say "Step 3/3: checksumming every copy"
+    pids=()
+    i=0
+    while [ $i -lt "$n" ]; do
+      hash_dest "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" "$STATE/$job.hash-dest$((i + 1))" &
+      pids+=($!)
+      i=$((i + 1))
+    done
+    for k in "${pids[@]}"; do wait "$k"; done
+  fi
 
   local ok=1
   if grep -q '^UNREADABLE' "$work/card.$HASH_ALGO"; then ok=0; say "  some files on the card could not be read"; fi
+  if grep -q '^COPYERROR' "$work/card.$HASH_ALGO"; then ok=0; say "  some files could not be copied"; fi
   i=1
   while [ $i -le "$n" ]; do
     if ! diff "$work/card.$HASH_ALGO" "$work/dest$i.$HASH_ALGO" > "$work/diff$i.txt"; then
@@ -675,17 +1029,28 @@ cmd_run() {
   fi
   say "RESULT: PASS - $job: all $count files match on $n destinations."
   say "  checksum list: $work/card.$HASH_ALGO"
+  local finished f; finished="$(date +%s)"
+  JOB="$job"
   for d in "${dests[@]}"; do
-    if cp -n "$work/card.$HASH_ALGO" "$d/dit-offloader_${job}_$stamp.$HASH_ALGO" 2>/dev/null; then
-      say "  checksum list saved: $d/dit-offloader_${job}_$stamp.$HASH_ALGO"
-    else
-      say "  note: could not save the checksum list in $d"
-    fi
+    case "$CHECKSUM_FILE" in
+      none)   continue ;;
+      list)   f="$(write_list "$d" "$work/card.$HASH_ALGO" "$stamp")" ;;
+      mhl)    f="$(write_mhl "$d" "$work/card.$HASH_ALGO" "$started" "$finished")" ;;
+      ascmhl) f="$(write_ascmhl "$d" "$work/card.$HASH_ALGO" "$started" "$finished")" ;;
+    esac
+    if [ -n "$f" ]; then say "  checksum file saved: $f"
+    else say "  note: could not save the checksum file in $d"; fi
   done
   if [ "$AUTO_EJECT" = yes ]; then
     if diskutil eject "$src" >/dev/null 2>&1; then say "Card ejected. Safe to remove."
     else say "Could not eject the card automatically. Run: dit-offloader eject $job"; fi
   fi
+}
+
+# Newest log of job $1. The date in the pattern keeps CAMA from matching CAMA-2's logs.
+job_log() {
+  # shellcheck disable=SC2012
+  ls -t "$STATE/$1"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9]*.log 2>/dev/null | head -1
 }
 
 running_jobs() {
@@ -733,7 +1098,7 @@ waiting() { printf '  %-24s waiting\n' "$1"; }
 # How far each running checksum has read into its current file: "<KB><TAB><file>" lines.
 read_offsets() {
   command -v lsof >/dev/null 2>&1 || return 0
-  lsof -o -o 0 -F no -c md5 -c xxhsum -c shasum -c md5sum -c perl 2>/dev/null |
+  lsof -o -o 0 -F no -c md5 -c xxhsum -c shasum -c md5sum -c perl -c tee 2>/dev/null |
     awk '/^o0t/ { o = substr($0, 4) } /^n/ { print int(o / 1024) "\t" substr($0, 2) }'
 }
 
@@ -755,6 +1120,10 @@ show_progress() {    # bars for running job $1
   started="$(awk -F'\t' '$1 == "step" { t = $3 } END { print t + 0 }' "$p")"
   total="$(awk -F'\t' '$1 == "total" { print $2 }' "$p")"
   n="$(grep -c '^dest' "$p")"
+  if [ "$(awk -F'\t' '$1 == "mode" { print $2 }' "$p")" = parallel ]; then
+    show_parallel "$job" "$p" "$now" "$step" "$total" "$n"
+    return
+  fi
   echo "  step $step of 3, $(time_text $((now - started))) into this step"
   i=0
   while IFS= read -r d; do
@@ -777,6 +1146,32 @@ show_progress() {    # bars for running job $1
     i=$((i + 1))
     if [ "$step" -lt 3 ]; then waiting "checksum destination $i"
     else hash_bar "checksum destination $i" "$STATE/$job.hash-dest$i" "$total" $((now - started)); fi
+  done
+}
+
+# Bars for a job copying in parallel mode: everything moves at once.
+show_parallel() {    # job, progress file, now, step, KB in all, number of destinations
+  local job="$1" p="$2" now="$3" step="$4" total="$5" n="$6" first i d base need have secs
+  first="$(awk -F'\t' '$1 == "step" && $2 == 1 { print $3 }' "$p")"
+  secs=$((now - first))
+  if [ "$step" -ge 2 ]; then echo "  copies done, finishing the checksums, $(time_text "$secs") in all"
+  else echo "  copying and checksumming at the same time, $(time_text "$secs") so far"; fi
+  i=0
+  while IFS= read -r d; do
+    i=$((i + 1))
+    read -r base need <<< "$(awk -F'\t' -v i="$i" '$1 == "dest" && $2 == i { print $3, $4 }' "$p")"
+    if [ "$step" -ge 2 ]; then bar "copy to destination $i" "$need" "$need" 0
+    else
+      have=$(( $(du -sk "$d" 2>/dev/null | cut -f1) - base ))
+      bar "copy to destination $i" "$have" "$need" "$secs"
+    fi
+  done < <(tail -n +2 "$STATE/$job.paths")
+  if [ "$step" -ge 2 ]; then bar "checksum card" "$total" "$total" 0
+  else hash_bar "checksum card" "$STATE/$job.hash-card" "$total" "$secs"; fi
+  i=0
+  while [ $i -lt "$n" ]; do
+    i=$((i + 1))
+    hash_bar "checksum destination $i" "$STATE/$job.hash-dest$i" "$total" "$secs"
   done
 }
 
@@ -844,8 +1239,7 @@ cmd_status() {
     if [ "$all" = no ] && [ -z "$(find "$p" -mmin -1440 2>/dev/null)" ]; then continue; fi
     found=1
     job="$(basename "$p" .pid)"
-    # shellcheck disable=SC2012
-    log="$(ls -t "$STATE/$job"-*.log 2>/dev/null | head -1)"
+    log="$(job_log "$job")"
     if job_alive "$job"; then state="RUNNING"
     elif [ -n "$log" ] && grep -q "RESULT:" "$log"; then state="finished"
     else state="INTERRUPTED"; fi
@@ -874,13 +1268,44 @@ cmd_eject() {
     CAM*) job="$1" ;;
     *) job="CAM$1" ;;
   esac
-  # shellcheck disable=SC2012
-  log="$(ls -t "$STATE/$job"-*.log 2>/dev/null | head -1)"
+  log="$(job_log "$job")"
   if [ -z "$log" ] || ! grep -q "RESULT: PASS" "$log"; then
     die "$job has not passed verification; not ejecting"
   fi
   read -r src < "$STATE/$job.paths"
   diskutil eject "$src"
+}
+
+# Clear finished offloads from "status". Their records move to $STATE/archive/<time>/,
+# so nothing is lost; the checksum files on the destinations are not touched.
+cmd_clear() {
+  local all=no p job log result moved=0 kept="" busy="" box f
+  case "$1" in
+    "") ;;
+    --all) all=yes ;;
+    *) die "usage: dit-offloader clear [--all]" ;;
+  esac
+  box="$STATE/archive/$(date '+%Y%m%d-%H%M%S')"
+  for p in "$STATE"/*.pid; do
+    [ -f "$p" ] || continue
+    job="$(basename "$p" .pid)"
+    if job_alive "$job"; then busy="$busy $job"; continue; fi
+    log="$(job_log "$job")"
+    result="INTERRUPTED"
+    [ -z "$log" ] || ! grep -q "RESULT:" "$log" || result="$(grep -o 'RESULT: [A-Z]*' "$log" | tail -1 | cut -d' ' -f2)"
+    if [ "$result" != PASS ] && [ $all = no ]; then kept="$kept $job($result)"; continue; fi
+    mkdir -p "$box" || die "could not create $box"
+    for f in "$STATE/$job".* "$STATE/$job"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9]*.log \
+             "$STATE/work-$job"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9]*; do
+      [ -e "$f" ] && mv "$f" "$box/"
+    done
+    echo "Cleared $job ($result)"
+    moved=$((moved + 1))
+  done
+  [ -z "$busy" ] || echo "Still running, not cleared:$busy"
+  [ -z "$kept" ] || echo "Not passed, kept so they stay visible:$kept   (dit-offloader clear --all clears them too)"
+  if [ $moved -gt 0 ]; then echo "Records kept in $box"
+  elif [ -z "$busy$kept" ]; then echo "Nothing to clear."; fi
 }
 
 make_fake_card() {
@@ -911,11 +1336,12 @@ detach_fakes() {
 # Practice run: builds a fake camera card and a fake audio card and offloads only those.
 cmd_rehearse() {
   need_mac; load_config
-  local cam aud n t ext folder rec args=() d
+  local cam aud n t ext folder rec args=() flags=() d
   while [ $# -gt 0 ]; do
     case "$1" in
       --to) [ -n "$2" ] || die "--to needs a drive name"; args+=(--to "$2"); shift 2 ;;
-      *) die "usage: dit-offloader rehearse [--to \"<drive>\"]" ;;
+      --parallel|--staged) flags+=("$1"); shift ;;
+      *) die "usage: dit-offloader rehearse [--to \"<drive>\"] [--parallel|--staged]" ;;
     esac
   done
   command -v hdiutil >/dev/null 2>&1 || die "rehearse needs macOS"
@@ -936,7 +1362,7 @@ cmd_rehearse() {
   done
   echo "index" > "$cam/OTHER/INDEX.BIN"
   echo "Fake camera card created: FAKECAM (clips named Z...)"
-  ( cmd_start "$TEST_PROJECT" "${args[@]}" --card FAKECAM ) || exit 1
+  ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --card FAKECAM ) || exit 1
 
   if [ "$AUDIO_ENABLED" = yes ]; then
     make_fake_card FAKEAUDIO
@@ -947,7 +1373,7 @@ cmd_rehearse() {
     done
     mkdir -p "$aud/250101_001$AUDIO_TAKE_SUFFIX"; echo old > "$aud/250101_001$AUDIO_TAKE_SUFFIX/250101_001_Tr1.WAV"
     echo "Fake audio card created: FAKEAUDIO (3 takes today, 1 old take)"
-    ( cmd_start "$TEST_PROJECT" "${args[@]}" --card FAKEAUDIO ) || exit 1
+    ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --card FAKEAUDIO ) || exit 1
   fi
 
   wait_for_jobs 90
@@ -965,13 +1391,14 @@ cmd_rehearse() {
 }
 
 case "$1" in
-  init)       cmd_init ;;
+  init)       cmd_init "$2" ;;
   config)     cmd_config ;;
   list)       cmd_list ;;
   start)      shift; cmd_start "$@" ;;
   _run)       cmd_run "$2" "$3" "$4" ;;
   status)     shift; cmd_status "$@" ;;
   eject)      cmd_eject "$2" ;;
+  clear)      cmd_clear "$2" ;;
   rehearse)   shift; cmd_rehearse "$@" ;;
   --version|-v|version) echo "dit-offloader $VERSION" ;;
   *)          usage ;;

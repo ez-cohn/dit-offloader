@@ -18,8 +18,10 @@ slow connection and keeps going if you disconnect.
 - Copies into a folder layout you define, such as `Project/Footage/2026-11-16/CAMA/`.
 - Copies the whole card, or only the video clips into one flat folder.
 - Verifies every file on every destination with MD5, SHA-1, SHA-256, xxHash64 or xxHash128.
-- Saves the checksum list next to the copies on every destination, so the proof travels
-  with the footage.
+- Copies in stages, or in parallel: the card read once, written to every destination at
+  the same time and checksummed in that same read, with each copy checked as it lands.
+- Saves the checksums next to the copies on every destination, so the proof travels
+  with the footage: as a plain list, a classic MHL, or an ASC MHL history.
 - Never deletes or overwrites a file. If a file with the same name already exists
   and differs, the offload stops before copying anything.
 - Checks free space before copying, counting what other running offloads still need.
@@ -73,13 +75,14 @@ until the offloads finish (Ctrl-C stops watching; the offloads keep running):
 
 | Command | What it does |
 |---|---|
-| `init` | Create the settings file |
+| `init [--print]` | Create the settings file, with every setting described. `--print` shows it instead, without touching your settings |
 | `config` | Show the settings in use |
 | `list` | Show mounted drives and which ones look like cards |
 | `start [project]` | Offload every recognised card. Without a project name, uses `PROJECT` from the settings |
 | `status [--all] [--watch]` | Show progress bars and results (last 24 hours, or everything). `--watch` keeps the screen updated until the offloads finish |
 | `eject <job>` | Eject a passed card by hand, e.g. `eject A` or `eject AUDIO` |
-| `rehearse` | Practice run with fake cards |
+| `clear [--all]` | Clear finished offloads from `status`. Failed and interrupted ones stay unless you add `--all`. Their records move to `~/.local/state/dit-offloader/archive` |
+| `rehearse` | Practice run with fake cards. Accepts `--to`, `--parallel` and `--staged` |
 
 Options for `start`:
 
@@ -90,10 +93,13 @@ Options for `start`:
 | `--cam <id>` | Camera id for that card, instead of working it out |
 | `--day YYYY-MM-DD` | Shoot day, if it is not today |
 | `--overnight` | Also take audio takes dated the day after the shoot day, for shoots past midnight |
+| `--parallel` / `--staged` | Copy in parallel or in stages for this run, whatever `COPY_MODE` says |
 
 ## Settings
 
-`dit-offloader init` writes a settings file with a note above every option. The main ones:
+`dit-offloader init` writes a settings file that describes every setting, the values it
+accepts and its default. If you already have a settings file, `dit-offloader init --print`
+shows the described version without changing yours. The main settings:
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -113,19 +119,53 @@ Options for `start`:
 | `AUDIO_ROOMTONE` | `none` | `last` labels the day's last take RoomTone |
 | `AUTO_EJECT` | `yes` | Eject a card after it passes |
 | `HASH_ALGO` | `md5` | `md5`, `sha1`, `sha256`, `xxh64` or `xxh128` (the xxHash ones are much faster) |
+| `COPY_MODE` | `staged` | `staged` or `parallel` (see below) |
+| `CHECKSUM_FILE` | `list` | `list`, `mhl`, `ascmhl` or `none` (see below) |
 
 See [examples](examples) for a complete settings file.
 
 ## How verification works
 
+Either way, a card passes only when every file read back from every destination matches
+the card's checksum.
+
+**Staged** (`COPY_MODE="staged"`, the default):
+
 1. The card is copied to the first destination.
 2. That copy is copied to the other destinations while the card is checksummed.
 3. Every copy is checksummed and compared with the card.
 
-A card passes only when every file matches on every destination. The checksum list is
-then saved in each destination folder as `dit-offloader_<job>_<time>.<algo>`, and a log
-for each offload is kept in `~/.local/state/dit-offloader`. To re-check a copy later,
-run this in the destination folder:
+**Parallel** (`COPY_MODE="parallel"`, or `start --parallel`):
+
+- The card is read once. What is read is written to every destination at the same time
+  and checksummed on the way, so the card is never read twice.
+- Each copied file is checksummed on every destination as soon as it lands, while the
+  next file copies.
+- Files are written as `<name>.dit-part` and only get their real name once complete.
+
+Parallel is usually faster with fast destinations (SSDs, RAIDs). It can be slower when
+several destinations share one spinning disk, because that disk then reads and writes at
+once. Copies keep the card's modification dates; their creation dates are the copy time.
+Time one shoot each way to see which suits your drives.
+
+## Checksum files
+
+After a card passes, its checksums are saved in each destination folder, chosen with
+`CHECKSUM_FILE`:
+
+| Value | What is saved | Checksums it can hold |
+|---|---|---|
+| `list` (default) | A plain list, `dit-offloader_<job>_<time>.<algo>` | all |
+| `mhl` | A classic Media Hash List (version 1.1), `<folder>_<date>_<time>.mhl`, the kind OffShoot and Silverstack write | `md5`, `sha1`, `xxh64` |
+| `ascmhl` | An ASC MHL history: an `ascmhl` folder with one generation per offload into that folder, and the chain file | `md5`, `sha1`, `xxh64`, `xxh128` |
+| `none` | Nothing (the checksums stay in the logs) | |
+
+The ASC MHL files are tested against the ASC's published schema and with its reference
+tool, `ascmhl`. Running `ascmhl create <folder>` later re-checks every file in that folder
+against the history and records the check as a new generation.
+
+A log for each offload is kept in `~/.local/state/dit-offloader`. To re-check a copy
+from a plain list later, run this in the destination folder:
 
 ```sh
 md5sum -c dit-offloader_CAMA_*.md5          # md5 (from coreutils)

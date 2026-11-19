@@ -7,4 +7,10 @@ jobs:
       - uses: actions/checkout@v4
       - run: brew install shellcheck xxhash
       - run: shellcheck -s bash bin/dit-offloader tests/run-tests.sh
+      # The ASC MHL reference tool and schemas, so the tests can check the MHL files.
+      - run: pipx install ascmhl
+      - run: git clone --depth 1 https://github.com/ascmitc/mhl /tmp/mhl
       - run: tests/run-tests.sh
+        env:
+          ASCMHL_XSD: /tmp/mhl/xsd/ASCMHL.xsd
+          ASCMHL_DIR_XSD: /tmp/mhl/xsd/ASCMHLDirectory__combined.xsd
