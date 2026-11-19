@@ -151,7 +151,7 @@ check "matching copy is reported" 'grep -q "1 copies are already at a destinatio
 echo "8. status and stale jobs"
 reset; mkdir -p "$T/state"
 echo 999999 > "$T/state/CAMQ.pid"; echo "12:00:00  Step 1/3: copying" > "$T/state/CAMQ-20260101-120000.log"
-check "unfinished job shows INTERRUPTED" '"$TOOL" status | grep -q "CAMQ: INTERRUPTED"'
+check "unfinished job shows INTERRUPTED" '"$TOOL" status 2>/dev/null | grep -q "CAMQ: INTERRUPTED"'
 echo $$ > "$T/state/CAMA.pid"
 sony_card "Untitled" A
 check "reused pid does not block a new offload" '"$TOOL" start P --to two >/dev/null 2>&1'
@@ -202,7 +202,7 @@ echo $other > "$T/state/CAMQ.pid"
 printf '%s\n%s\n%s\n' "$V/Q" "$V/one/P" "$V/two/P" > "$T/state/CAMQ.paths"
 printf 'dest\t1\t0\t2048\ndest\t2\t0\t2048\ntotal\t4096\nstep\t2\t%s\n' "$(date +%s)" > "$T/state/CAMQ.progress"
 printf '1024\t1024\t%s\n' "$V/Q/clip.MXF" > "$T/state/CAMQ.hash-card"
-LANG=C "$TOOL" status > "$T/status.out"
+LC_ALL=C LC_CTYPE=C LANG=C "$TOOL" status > "$T/status.out"
 kill $other 2>/dev/null; wait $other 2>/dev/null
 check "first copy shows done" 'grep -q "copy to destination 1 *#* 100%" "$T/status.out"'
 check "second copy shows bytes arrived" 'grep -q "copy to destination 2 *#*\.* *5[0-9]%" "$T/status.out"'
@@ -332,12 +332,12 @@ mkdir -p "$V/two/P/Footage/$ISO/CAMB/XDROOT/Clip"; echo different > "$V/two/P/Fo
 bash -c 'sleep 60; :' _run CAMQ camera Q & other=$!
 echo $other > "$T/state/CAMQ.pid"
 "$TOOL" clear > "$T/clear.out"
-check "passed job cleared" 'grep -q "Cleared CAMA (PASS)" "$T/clear.out" && ! "$TOOL" status | grep -q "CAMA:"'
-check "failed job kept" 'grep -q "CAMB(FAIL)" "$T/clear.out" && "$TOOL" status | grep -q "CAMB: finished"'
+check "passed job cleared" 'grep -q "Cleared CAMA (PASS)" "$T/clear.out" && ! "$TOOL" status 2>/dev/null | grep -q "CAMA:"'
+check "failed job kept" 'grep -q "CAMB(FAIL)" "$T/clear.out" && "$TOOL" status 2>/dev/null | grep -q "CAMB: finished"'
 check "running job kept" 'grep -q "Still running, not cleared: CAMQ" "$T/clear.out"'
 check "records moved to the archive" '[ -n "$(find "$T/state/archive" -name "CAMA-*.log")" ]'
 "$TOOL" clear --all >/dev/null
-check "--all clears the failed job" '! "$TOOL" status | grep -q "CAMB:"'
+check "--all clears the failed job" '! "$TOOL" status 2>/dev/null | grep -q "CAMB:"'
 kill $other 2>/dev/null; wait $other 2>/dev/null
 "$TOOL" clear --all >/dev/null
 check "nothing left says so" '"$TOOL" clear | grep -q "Nothing to clear"'
@@ -362,7 +362,7 @@ printf '%s\n%s\n%s\n' "$V/Q" "$V/one/P" "$V/two/P" > "$T/state/CAMQ.paths"
 printf 'dest\t1\t0\t2048\ndest\t2\t0\t2048\ntotal\t4096\nmode\tparallel\nstep\t1\t%s\n' "$(date +%s)" > "$T/state/CAMQ.progress"
 printf '1024\t1024\t%s\n' "$V/Q/clip.MXF" > "$T/state/CAMQ.hash-card"
 printf '1024\t1024\t%s\n' "$V/two/P/clip.MXF" > "$T/state/CAMQ.hash-dest2"
-LANG=C "$TOOL" status > "$T/status.out"
+LC_ALL=C LC_CTYPE=C LANG=C "$TOOL" status > "$T/status.out"
 kill $other 2>/dev/null; wait $other 2>/dev/null
 check "header says everything runs at once" 'grep -q "copying and checksumming at the same time" "$T/status.out"'
 check "second copy shows bytes arrived" 'grep -q "copy to destination 2 *#*\.* *5[0-9]%" "$T/status.out"'
