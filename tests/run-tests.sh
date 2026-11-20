@@ -29,6 +29,34 @@ echo "fakedisk 1000000 0 $FAKE_FREE_KB 0% /fake drive"
 SHIM
 chmod +x "$T/dfbin/df"
 chmod +x "$T/bin/"*
+# The helper that clears copies from memory before they are checked (Homebrew builds it).
+cc -O2 -o "$T/bin/dit-offloader-evict" "$(dirname "$TOOL")/../src/dit-offloader-evict.c" || exit 1
+# Runs a command in a simulated terminal, typing answers when prompts appear:
+#   python3 drive.py "<prompt text>=<answer>"... -- command args
+cat > "$T/drive.py" <<'PYTHON'
+import os, pty, select, sys, time
+cut = sys.argv.index("--")
+pairs = [a.split("=", 1) for a in sys.argv[1:cut]]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(sys.argv[cut + 1], sys.argv[cut + 1:])
+buf, start = b"", time.time()
+while time.time() - start < 90:
+    ready, _, _ = select.select([fd], [], [], 0.3)
+    if ready:
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            break
+        if not data:
+            break
+        buf += data
+    if pairs and pairs[0][0].encode() in buf:
+        time.sleep(0.2)
+        os.write(fd, pairs.pop(0)[1].encode() + b"\r")
+os.waitpid(pid, 0)
+sys.stdout.write(buf.decode("utf-8", "replace"))
+PYTHON
 export PATH="$T/bin:$PATH" SHIM_EJECTED="$T/ejected" DIT_OFFLOADER_ALLOW_NON_MAC=1
 export DIT_OFFLOADER_VOLUMES="$T/vol" DIT_OFFLOADER_STATE="$T/state" DIT_OFFLOADER_CONFIG="$T/config"
 V="$T/vol"; TODAY="$(date '+%y%m%d')"; ISO="$(date '+%Y-%m-%d')"
@@ -333,7 +361,7 @@ bash -c 'sleep 60; :' _run CAMQ camera Q & other=$!
 echo $other > "$T/state/CAMQ.pid"
 "$TOOL" clear > "$T/clear.out"
 check "passed job cleared" 'grep -q "Cleared CAMA (PASS)" "$T/clear.out" && ! "$TOOL" status 2>/dev/null | grep -q "CAMA:"'
-check "failed job kept" 'grep -q "CAMB(FAIL)" "$T/clear.out" && "$TOOL" status 2>/dev/null | grep -q "CAMB: finished"'
+check "failed job kept" 'grep -q "CAMB(FAIL)" "$T/clear.out" && "$TOOL" status 2>/dev/null | grep -q "CAMB: FAILED"'
 check "running job kept" 'grep -q "Still running, not cleared: CAMQ" "$T/clear.out"'
 check "records moved to the archive" '[ -n "$(find "$T/state/archive" -name "CAMA-*.log")" ]'
 "$TOOL" clear --all >/dev/null
@@ -347,7 +375,9 @@ echo "17. settings template"
 for name in PROJECT DESTINATIONS MIN_DESTINATIONS VIDEO_PATH AUDIO_PATH DATE_FORMAT VIDEO_MODE \
             VIDEO_EXTENSIONS CLIP_FOLDERS CAMERA_MARKERS CAM_SOURCE RENAME_CARD AUDIO_ENABLED \
             AUDIO_TAKE_SUFFIX AUDIO_RENAME AUDIO_NAME AUDIO_TAKE_LABEL AUDIO_ROOMTONE AUDIO_TRACKS \
-            COPY_MODE HASH_ALGO CHECKSUM_FILE AUTO_EJECT; do
+            COPY_MODE HASH_ALGO CHECKSUM_FILE AUTO_EJECT WATCH_ON_START SHOOT_DAY DAY_STARTS_AT \
+            DAY_CHECK AUDIO_TAKES SOURCE_RECHECK KEEP_FILE_INFO TERMINAL_ALERTS REPORT_FORMAT \
+            REPORT_PATH; do
   check "template describes $name" 'grep -Eq "^# ([A-Z_]+ and )?$name[ :]" "$T/template" && grep -q "^#\{0,1\}$name=" "$T/template"'
 done
 check "every setting in the template is one the tool reads" '[ -z "$(grep -o "^#\{0,1\}[A-Z_]*=" "$T/template" | tr -d "#=" | while read -r v; do grep -q "^$v=" "$TOOL" || echo "$v"; done)" ]'
@@ -469,6 +499,241 @@ PATH="$T/slowbin:$PATH" "$TOOL" start P --to two >/dev/null 2>&1
 sleep 2
 "$TOOL" stop --all > "$T/stop.out" 2>&1
 check "stop --all stops every running offload" 'grep -q "Stopped CAMA" "$T/stop.out" && grep -q "Stopped CAMB" "$T/stop.out" && ! pgrep -f "dit-offloader _run" >/dev/null'
+
+echo "21. copies are checked from the drive, not from memory"
+head -c 20000000 /dev/urandom > "$T/cached.bin"; cat "$T/cached.bin" > /dev/null
+check "the helper clears a file from memory" '[ "$(dit-offloader-evict "$T/cached.bin")" -le 1 ]'
+check "the helper fails on a missing file" '! dit-offloader-evict "$T/missing.bin" >/dev/null'
+reset; sony_card "Untitled" A
+printf 'DESTINATIONS=("one")\nCOPY_MODE="parallel"\nAUTO_EJECT="no"\n' > "$T/config"
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+check "parallel offload passes" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+check "no copy was checked from memory" '! grep -q "still in memory" "$T"/state/CAMA-*.log'
+mkdir -p "$T/noevict"; cp "$T/bin/diskutil" "$T/bin/hdiutil" "$T/noevict/"
+check "parallel mode refuses without the helper" 'PATH="$T/noevict:/usr/bin:/bin" "$TOOL" start P --to two 2>&1 | grep -q "needs dit-offloader-evict"'
+
+echo "22. second read of the card (SOURCE_RECHECK)"
+# A tee that changes the data it reads, as a faulty reader would: every copy gets the same
+# wrong data, so only a second read of the card can notice.
+mkdir -p "$T/badread"
+printf '#!/bin/bash\ntr a b | "%s" "$@"\n' "$REAL_TEE" > "$T/badread/tee"
+chmod +x "$T/badread/tee"
+for recheck in no yes; do
+  reset; sony_card "Untitled" A
+  printf 'DESTINATIONS=("one")\nCOPY_MODE="parallel"\nAUTO_EJECT="no"\nSOURCE_RECHECK="%s"\n' $recheck > "$T/config"
+  PATH="$T/badread:$PATH" "$TOOL" start P --to two >/dev/null 2>&1; settle
+  if [ $recheck = no ]; then
+    check "without it, a bad read goes unnoticed (why it exists)" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+  else
+    check "with it, the card is read again" 'grep -q "Reading the card a second time" "$T"/state/CAMA-*.log'
+    check "and the bad read fails the offload" 'grep -q "RESULT: FAIL" "$T"/state/CAMA-*.log && grep -q "different data when read a second time" "$T"/state/CAMA-*.log'
+  fi
+done
+reset; sony_card "Untitled" A
+printf 'DESTINATIONS=("one")\nCOPY_MODE="parallel"\nSOURCE_RECHECK="yes"\n' > "$T/config"
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+check "a good card passes the second read" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log'
+
+echo "23. status headings and summary"
+reset; sony_card "Untitled" A; sony_card "Untitled 1" B
+printf 'DESTINATIONS=("one")\n' > "$T/config"
+mkdir -p "$V/two/P/Footage/$ISO/CAMB/XDROOT/Clip"; echo different > "$V/two/P/Footage/$ISO/CAMB/XDROOT/Clip/B001L001_x.MXF"
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+"$TOOL" status > "$T/status.out" 2>&1
+check "a passed card says PASSED" 'grep -q "===== CAMA: PASSED =====" "$T/status.out"'
+check "a failed card says FAILED" 'grep -q "===== CAMB: FAILED =====" "$T/status.out"'
+check "a summary line counts them" 'grep -q "^Summary: 1 passed .* 1 NOT passed: CAMB (FAILED)" "$T/status.out"'
+check "no colour codes when not in a terminal" '! grep -q "$(printf "\033")" "$T/status.out"'
+
+echo "24. wait and Terminal alerts"
+check "wait with nothing running says so" '"$TOOL" wait | grep -q "No offloads are running"'
+reset; sony_card "Untitled" A
+printf 'DESTINATIONS=("one")\nCOPY_MODE="parallel"\n' > "$T/config"
+PATH="$T/slowbin:$PATH" "$TOOL" start P --to two >/dev/null 2>&1
+"$TOOL" wait > "$T/wait.out" 2>&1; rc=$?
+check "wait waits for the offload" 'grep -q "Waiting for: CAMA" "$T/wait.out" && grep -q "CAMA PASSED" "$T/wait.out"'
+check "wait ends with the summary and exit status 0" 'grep -q "ALL 1 PASSED: CAMA" "$T/wait.out" && [ $rc = 0 ]'
+check "no bell or title without a terminal" '! grep -q "$(printf "\a")" "$T/wait.out" && ! grep -q "$(printf "\033]0;")" "$T/wait.out"'
+reset; sony_card "Untitled" C
+mkdir -p "$V/two/P/Footage/$ISO/CAMC/XDROOT/Clip"; echo different > "$V/two/P/Footage/$ISO/CAMC/XDROOT/Clip/C001L001_x.MXF"
+printf 'DESTINATIONS=("one")\n' > "$T/config"
+"$TOOL" start P --to two >/dev/null 2>&1
+"$TOOL" wait > "$T/wait.out" 2>&1; rc=$?
+check "wait exits 1 when one did not pass" 'grep -q "NOT PASSED: CAMC (FAILED)" "$T/wait.out" && [ $rc = 1 ]'
+if command -v python3 >/dev/null 2>&1; then
+  reset; sony_card "Untitled" A
+  printf 'DESTINATIONS=("one")\nCOPY_MODE="parallel"\nTERMINAL_ALERTS="bell title summary"\n' > "$T/config"
+  PATH="$T/slowbin:$PATH" "$TOOL" start P --to two >/dev/null 2>&1
+  python3 "$T/drive.py" -- "$TOOL" wait > "$T/wait.out" 2>&1
+  check "in a terminal, the bell rings when a card passes" 'grep -q "$(printf "\a")" "$T/wait.out"'
+  check "and the title shows the counts" 'grep -q "dit-offloader: 0 running, 1 passed, 0 not passed" "$T/wait.out"'
+fi
+printf 'DESTINATIONS=("one")\nTERMINAL_ALERTS="bell sirens"\n' > "$T/config"
+check "an unknown alert is refused" '"$TOOL" start P --to two 2>&1 | grep -q "TERMINAL_ALERTS takes"'
+
+echo "25. a lock left by a stopped offload"
+reset; sony_card "Untitled" A
+printf 'DESTINATIONS=("one")\n' > "$T/config"
+mkdir -p "$T/state/space.lock"; echo 999999 > "$T/state/space.lock/pid"
+start_time=$(date +%s)
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+check "a stale lock is cleared at once" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log && ! grep -q "held the free space check" "$T"/state/CAMA-*.log && [ $(( $(date +%s) - start_time )) -lt 60 ]'
+check "and no lock is left behind" '[ ! -e "$T/state/space.lock" ]'
+
+echo "26. file information (KEEP_FILE_INFO)"
+if [ "$(uname)" = Darwin ]; then
+  for mode in staged parallel; do
+    for keep in yes no; do
+      reset; sony_card "Untitled" A
+      f="$V/Untitled/XDROOT/Clip/A001L001_x.MXF"
+      touch -t 202001020304 "$f"; touch -t 202103040506 "$f"     # created 2020, modified 2021
+      xattr -w com.example.dit "kept" "$f"
+      printf 'DESTINATIONS=("one")\nCOPY_MODE="%s"\nKEEP_FILE_INFO="%s"\nAUTO_EJECT="no"\n' $mode $keep > "$T/config"
+      "$TOOL" start P --to two >/dev/null 2>&1; settle
+      c="$V/two/P/Footage/$ISO/CAMA/XDROOT/Clip/A001L001_x.MXF"
+      if [ $keep = yes ]; then
+        check "$mode, yes: creation date kept" '[ "$(stat -f %B "$c")" = "$(stat -f %B "$f")" ]'
+        check "$mode, yes: Finder information kept" '[ "$(xattr -p com.example.dit "$c" 2>/dev/null)" = kept ]'
+      else
+        check "$mode, no: creation date is the modification date" '[ "$(stat -f %B "$c")" = "$(stat -f %m "$f")" ]'
+      fi
+      check "$mode, $keep: modification date kept" '[ "$(stat -f %m "$c")" = "$(stat -f %m "$f")" ]'
+    done
+  done
+else
+  echo "  (creation dates and Finder information exist on macOS only; checked there)"
+fi
+
+echo "27. clear --purge"
+mkdir -p "$T/state/archive/20200101-000000" "$T/state/archive/fresh"
+touch -t 202001010000 "$T/state/archive/20200101-000000"
+"$TOOL" clear --purge 30 > "$T/purge.out"
+check "old archived records are deleted" '[ ! -e "$T/state/archive/20200101-000000" ] && grep -q "Deleted 1 archived" "$T/purge.out"'
+check "recent ones are kept" '[ -d "$T/state/archive/fresh" ]'
+check "--purge needs a number" '! "$TOOL" clear --purge soon 2>/dev/null'
+
+echo "28. offload report"
+reset; sony_card "Untitled" A; sony_card "Untitled 1" B; audio_card "REC"
+printf 'DESTINATIONS=("one")\nREPORT_FORMAT="html text"\nREPORT_PATH="{project}/Reports"\nAUTO_EJECT="no"\n' > "$T/config"
+mkdir -p "$V/two/P/Footage/$ISO/CAMB/XDROOT/Clip"; echo different > "$V/two/P/Footage/$ISO/CAMB/XDROOT/Clip/B001L001_x.MXF"
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+R="$V/one/P/Reports/${ISO}_P_offload-report"
+check "text and HTML reports on every destination" '[ -f "$R.txt" ] && [ -f "$R.html" ] && [ -f "$V/two/P/Reports/${ISO}_P_offload-report.html" ]'
+check "the report counts passes and failures" 'grep -q "3 offloads: 2 passed, 1 FAILED (CAMB)" "$R.txt"'
+sum="$(md5 -q "$V/Untitled/XDROOT/Clip/A001L001_x.MXF" 2>/dev/null || md5sum < "$V/Untitled/XDROOT/Clip/A001L001_x.MXF" | cut -d" " -f1)"
+check "the report lists each file with its checksum" '[ -n "$sum" ] && grep -q "A001L001_x.MXF .*$sum" "$R.txt"'
+check "the report says why a card failed before copying" 'grep -q "Why: files already at a destination differ from the card" "$R.txt"'
+check "the HTML report marks the failure" 'grep -q "class=\"fail\">FAIL" "$R.html"'
+cat > "$T/tags.py" <<'PYTHON'
+import html.parser, sys
+class Tags(html.parser.HTMLParser):
+    VOID = {"meta", "br", "img", "link", "input", "hr"}
+    def __init__(self):
+        super().__init__(); self.open, self.bad = [], 0
+    def handle_starttag(self, tag, attrs):
+        if tag not in self.VOID: self.open.append(tag)
+    def handle_endtag(self, tag):
+        if self.open and self.open[-1] == tag: self.open.pop()
+        else: self.bad += 1
+t = Tags(); t.feed(open(sys.argv[1], encoding="utf-8").read())
+sys.exit(1 if t.open or t.bad else 0)
+PYTHON
+check "the HTML report's tags all match up" '! command -v python3 >/dev/null || python3 "$T/tags.py" "$R.html"'
+check "report shows it in Terminal" '"$TOOL" report P | grep -q "3 offloads: 2 passed, 1 FAILED"'
+check "report says when there is nothing" '"$TOOL" report Nope | grep -q "No offloads recorded"'
+printf 'DESTINATIONS=("one")\nREPORT_FORMAT="pdf"\n' > "$T/config"
+check "an unknown report format is refused" '"$TOOL" start P --to two 2>&1 | grep -q "REPORT_FORMAT takes"'
+
+echo "29. shoot day"
+reset; sony_card "Untitled" A
+printf 'DESTINATIONS=("one")\nSHOOT_DAY="cutoff"\nDAY_STARTS_AT="23:59"\nDAY_CHECK="off"\n' > "$T/config"
+YESTERDAY="$(date -v-1d '+%Y-%m-%d' 2>/dev/null || date -d yesterday '+%Y-%m-%d')"
+if [ "$(date '+%H%M')" -lt 2359 ]; then
+  "$TOOL" start P --to two >/dev/null 2>&1; settle
+  check "cutoff: before the new day starts, it is the previous day" '[ -d "$V/one/P/Footage/$YESTERDAY/CAMA" ]'
+fi
+reset; sony_card "Untitled" A
+printf 'DESTINATIONS=("one")\nSHOOT_DAY="cutoff"\nDAY_STARTS_AT="00:00"\n' > "$T/config"
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+check "cutoff: after it, today" '[ -d "$V/one/P/Footage/$ISO/CAMA" ]'
+reset; sony_card "Untitled" A
+find "$V/Untitled" -type f -exec touch -t 202512311200 {} +
+printf 'DESTINATIONS=("one")\nSHOOT_DAY="clips"\n' > "$T/config"
+"$TOOL" start P --to two > "$T/start.out" 2>&1; settle
+check "clips: the card's own date" '[ -d "$V/one/P/Footage/2025-12-31/CAMA" ] && grep -q "from the card" "$T/start.out"'
+reset; sony_card "Untitled" A
+find "$V/Untitled" -type f -exec touch -t 202512311200 {} +
+printf 'DESTINATIONS=("one")\n' > "$T/config"
+"$TOOL" start P --to two > "$T/start.out" 2>&1; settle
+check "DAY_CHECK=warn: notes the mismatch" 'grep -q "is dated 2025-12-31 (2), not the shoot day $ISO" "$T/start.out"'
+check "and goes ahead" 'grep -q "RESULT: PASS" "$T"/state/CAMA-*.log && [ -d "$V/one/P/Footage/$ISO/CAMA" ]'
+reset; sony_card "Untitled" A
+find "$V/Untitled" -type f -exec touch -t 202512311200 {} +
+printf 'DESTINATIONS=("one")\nDAY_CHECK="stop"\n' > "$T/config"
+"$TOOL" start P --to two > "$T/start.out" 2>&1; settle
+check "DAY_CHECK=stop: does not start the card" 'grep -q "not started (DAY_CHECK=stop)" "$T/start.out" && [ ! -e "$T/state/CAMA.pid" ]'
+"$TOOL" start P --to two --day 2025-12-31 >/dev/null 2>&1; settle
+check "--day settles it" '[ -d "$V/one/P/Footage/2025-12-31/CAMA" ]'
+reset; sony_card "Untitled" A
+printf 'DESTINATIONS=("one")\nSHOOT_DAY="ask"\n' > "$T/config"
+"$TOOL" start P --to two > "$T/start.out" 2>&1; settle
+check "ask without a terminal: today, with a note" 'grep -q "no terminal to ask in; using today" "$T/start.out" && [ -d "$V/one/P/Footage/$ISO/CAMA" ]'
+if command -v python3 >/dev/null 2>&1; then
+  reset; sony_card "Untitled" A
+  python3 "$T/drive.py" "Shoot day as YYYY-MM-DD=2025-06-07" -- "$TOOL" start P --to two > "$T/start.out" 2>&1; settle
+  check "ask in a terminal: shows the card's dates" 'grep -q "Untitled: $ISO (2)" "$T/start.out"'
+  check "and uses the day typed" '[ -d "$V/one/P/Footage/2025-06-07/CAMA" ]'
+fi
+
+echo "30. audio takes and room tone"
+audio_sized() {   # takes 001 and 010 bigger than 002, so 002 is the shortest
+  audio_card "$1"
+  head -c 200000 /dev/urandom > "$V/$1/${TODAY}_001.TAKE/${TODAY}_001_Tr2.WAV"
+  head -c 200000 /dev/urandom > "$V/$1/${TODAY}_010.TAKE/${TODAY}_010_Tr2.WAV"
+}
+A="P/Audio/$ISO"
+rt() {            # roomtone setting, extra start options -> take folder labelled RoomTone
+  reset; audio_sized "REC"
+  printf 'DESTINATIONS=("one")\nAUDIO_RENAME="yes"\nAUDIO_ROOMTONE="%s"\nAUTO_EJECT="no"\n' "$1" > "$T/config"
+  shift
+  "$TOOL" start P --to two "$@" > "$T/start.out" 2>&1; settle
+  find "$V/one/$A" -name "*RoomTone*" | sed 's|.*/\([^/]*\.TAKE\)/.*|\1|' | sort -u
+}
+check "first" '[ "$(rt first)" = "${TODAY}_001.TAKE" ]'
+check "last" '[ "$(rt last)" = "${TODAY}_010.TAKE" ]'
+check "a take number" '[ "$(rt 2)" = "${TODAY}_002.TAKE" ]'
+check "shortest" '[ "$(rt shortest)" = "${TODAY}_002.TAKE" ]'
+check "none" '[ -z "$(rt none)" ]'
+check "--roomtone overrides the setting" '[ -z "$(rt last --roomtone none)" ]'
+check "a take that is not there: none, with a note" '[ -z "$(rt 7)" ] && grep -q "take 7 is not among" "$T/start.out"'
+check "ask without a terminal: none, with a note" '[ -z "$(rt ask)" ] && grep -q "no take is labelled RoomTone" "$T/start.out"'
+check "start shows the takes and the choice" '[ -n "$(rt last)" ] && grep -q "Takes: 3 (${TODAY}_001.TAKE to ${TODAY}_010.TAKE)   RoomTone: ${TODAY}_010.TAKE" "$T/start.out"'
+if command -v python3 >/dev/null 2>&1; then
+  reset; audio_sized "REC"
+  printf 'DESTINATIONS=("one")\nAUDIO_RENAME="yes"\nAUDIO_ROOMTONE="ask"\n' > "$T/config"
+  python3 "$T/drive.py" "Which take is the room tone?=10" -- "$TOOL" start P --to two > "$T/start.out" 2>&1; settle
+  check "ask in a terminal: lists the takes" 'grep -q "take   2   ${TODAY}_002.TAKE" "$T/start.out"'
+  check "and labels the take chosen" '[ -n "$(find "$V/one/$A/${TODAY}_010.TAKE" -name "*RoomTone*")" ]'
+fi
+# The same takes offloaded again with another choice: refused, so no take is stored twice.
+rt last >/dev/null
+"$TOOL" start P --to two --roomtone none >/dev/null 2>&1; settle
+check "takes already stored under other names are refused" 'grep -q "already on a destination under other names" "$(ls -t "$T"/state/AUDIO-*.log | head -1)"'
+check "and nothing new is copied" '[ -z "$(find "$V/one/$A/${TODAY}_010.TAKE" -name "*Tk10*")" ]'
+reset; audio_sized "REC"
+printf 'DESTINATIONS=("one")\nAUDIO_TAKES="all"\n' > "$T/config"
+"$TOOL" start P --to two >/dev/null 2>&1; settle
+check "AUDIO_TAKES=all takes every take on the card" '[ -d "$V/one/$A/200101_001.TAKE" ] && [ -d "$V/one/$A/${TODAY}_010.TAKE" ]'
+reset; audio_sized "REC"
+printf 'DESTINATIONS=("one")\n' > "$T/config"
+"$TOOL" start P --to two --day 2024-02-02 > "$T/start.out" 2>&1; settle
+check "no takes of the day: not started, with the dates found" 'grep -q "no takes dated 240202 on REC" "$T/start.out" && [ ! -e "$T/state/AUDIO.pid" ]'
+if command -v python3 >/dev/null 2>&1; then
+  reset; audio_sized "REC"
+  printf 'DESTINATIONS=("one")\nAUDIO_TAKES="ask"\n' > "$T/config"
+  python3 "$T/drive.py" "Which takes?=200101" -- "$TOOL" start P --to two > "$T/start.out" 2>&1; settle
+  check "AUDIO_TAKES=ask: takes the day typed" '[ -d "$V/one/$A/200101_001.TAKE" ] && [ ! -d "$V/one/$A/${TODAY}_001.TAKE" ]'
+fi
 
 echo
 if [ $fails = 0 ]; then echo "All tests passed."; else echo "$fails test(s) failed."; exit 1; fi

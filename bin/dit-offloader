@@ -5,7 +5,7 @@
 # Copies every card to all destinations, then re-reads the card and every copy and
 # compares checksums. It never deletes or overwrites a file.
 
-VERSION="0.3.2"
+VERSION="0.4.0"
 
 CONFIG="${DIT_OFFLOADER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dit-offloader/config}"
 STATE="${DIT_OFFLOADER_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dit-offloader}"
@@ -41,6 +41,15 @@ HASH_ALGO="md5"
 COPY_MODE="staged"
 CHECKSUM_FILE="list"
 WATCH_ON_START="no"
+SHOOT_DAY="today"
+DAY_STARTS_AT="05:00"
+DAY_CHECK="warn"
+AUDIO_TAKES="day"
+SOURCE_RECHECK="no"
+TERMINAL_ALERTS="summary"
+KEEP_FILE_INFO="yes"
+REPORT_FORMAT="none"
+REPORT_PATH='{project}/Reports'
 
 say() { echo "$(date '+%H:%M:%S')  $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -58,8 +67,13 @@ dit-offloader $VERSION - verified camera and audio card offloads
   dit-offloader eject <job>               eject a card that passed (e.g. A or AUDIO)
   dit-offloader stop <job>|--all          stop a running offload (e.g. A or AUDIO); the card
                                           stays mounted and is not ejected
-  dit-offloader clear [--all]             clear finished offloads from status
-                                          (--all: failed and interrupted ones too)
+  dit-offloader wait                      wait until the running offloads finish, then
+                                          show how they ended (exit status 0: all passed)
+  dit-offloader clear [--all] [--purge N] clear finished offloads from status
+                                          (--all: failed and interrupted ones too;
+                                          --purge N: delete records cleared over N days ago)
+  dit-offloader report [project] [--day YYYY-MM-DD] [--html]
+                                          show the offload report of a project and day
   dit-offloader rehearse [options]        practice run with two small fake cards
                                           (accepts --to, --parallel and --staged)
 
@@ -69,6 +83,8 @@ Options for start:
   --cam <id>         camera id for that card, instead of working it out
   --day YYYY-MM-DD   shoot day, if it is not today
   --overnight        also take audio takes dated the day after the shoot day
+  --roomtone <which> the take to label RoomTone: none, ask, last, first, shortest or
+                     a take number (overrides AUDIO_ROOMTONE in the settings file)
   --parallel         copy to every destination and checksum at the same time
   --staged           copy and checksum one stage after another
                      (both override COPY_MODE in the settings file)
@@ -82,6 +98,7 @@ USAGE
 
 load_config() {
   [ -f "$CONFIG" ] || die "no settings file yet. Run: dit-offloader init"
+  CONFIG_LOADED=yes
   # shellcheck disable=SC1090
   . "$CONFIG" || die "could not read $CONFIG"
   case "$VIDEO_MODE" in full|clips) ;; *) die "VIDEO_MODE must be full or clips" ;; esac
@@ -91,7 +108,23 @@ load_config() {
     xxh64|xxh128) command -v xxhsum >/dev/null 2>&1 || die "HASH_ALGO=$HASH_ALGO needs xxhsum. Run: brew install xxhash" ;;
     *) die "HASH_ALGO must be md5, sha1, sha256, xxh64 or xxh128" ;;
   esac
-  case "$AUDIO_ROOMTONE" in last|none) ;; *) die "AUDIO_ROOMTONE must be last or none" ;; esac
+  case "$AUDIO_ROOMTONE" in
+    none|ask|last|first|shortest) ;;
+    *[!0-9]*|"") die "AUDIO_ROOMTONE must be none, ask, last, first, shortest or a take number" ;;
+  esac
+  case "$SHOOT_DAY" in today|cutoff|clips|ask) ;; *) die "SHOOT_DAY must be today, cutoff, clips or ask" ;; esac
+  case "$DAY_STARTS_AT" in [0-2][0-9]:[0-5][0-9]) ;; *) die "DAY_STARTS_AT must be a time as HH:MM, e.g. \"05:00\"" ;; esac
+  case "$DAY_CHECK" in warn|stop|off) ;; *) die "DAY_CHECK must be warn, stop or off" ;; esac
+  case "$AUDIO_TAKES" in day|all|ask) ;; *) die "AUDIO_TAKES must be day, all or ask" ;; esac
+  case "$SOURCE_RECHECK" in yes|no) ;; *) die "SOURCE_RECHECK must be yes or no" ;; esac
+  case "$KEEP_FILE_INFO" in yes|no) ;; *) die "KEEP_FILE_INFO must be yes or no" ;; esac
+  local w
+  for w in $TERMINAL_ALERTS; do
+    case "$w" in bell|title|summary|none) ;; *) die "TERMINAL_ALERTS takes bell, title, summary (any of them, separated by spaces) or none" ;; esac
+  done
+  for w in $REPORT_FORMAT; do
+    case "$w" in text|html|none) ;; *) die "REPORT_FORMAT takes text, html (one or both, separated by a space) or none" ;; esac
+  done
   case "$COPY_MODE" in staged|parallel) ;; *) die "COPY_MODE must be staged or parallel" ;; esac
   case "$WATCH_ON_START" in yes|no) ;; *) die "WATCH_ON_START must be yes or no" ;; esac
   case "$CHECKSUM_FILE" in
@@ -137,10 +170,64 @@ hash_stdin() {
   esac
 }
 
+# The helper that clears a file from memory before it is checksummed (see
+# src/dit-offloader-evict.c). Installed next to dit-offloader by Homebrew.
+EVICT_BIN="$(command -v dit-offloader-evict 2>/dev/null)"
+IS_MAC=no; [ "$(uname)" = Darwin ] && IS_MAC=yes
+
+# Checksum of file $1 as it is stored on its drive. Right after a copy, macOS can still hold
+# the file in memory, and a plain read would only check that memory; so the file is pushed
+# out of memory first. Notes about that go to standard error, which is the offload's log.
+fresh_hash() {
+  local left
+  if [ -n "$EVICT_BIN" ] && [ -e "$1" ]; then
+    left="$("$EVICT_BIN" "$1" 2>/dev/null)"
+    case "$left" in
+      ""|0|1) ;;
+      -1) note_once "$1" "could not tell whether copies in $(dirname "$1") were cleared from memory before checking" ;;
+      *) echo "$(date '+%H:%M:%S')    note: $left% of $1 was still in memory when it was checked" >&2 ;;
+    esac
+  fi
+  hash_of "$1"
+}
+
+note_once() {        # file, message: say it once per folder per offload
+  local mark
+  [ -n "$WORK" ] || return 0
+  mark="$WORK/noted-$(dirname "$1" | cksum | cut -d' ' -f1)"
+  [ -e "$mark" ] && return 0
+  : > "$mark"
+  echo "$(date '+%H:%M:%S')    note: $2" >&2
+}
+
+# Give copy $2 the dates of $1 (and with KEEP_FILE_INFO, its creation date and any extra
+# Finder information). macOS moves a file's creation date back when its modification date
+# is set earlier, which is how the creation date gets set.
+copy_dates() {
+  local born mod a
+  if [ "$KEEP_FILE_INFO" = yes ] && [ $IS_MAC = yes ]; then
+    born="$(stat -f %B "$1" 2>/dev/null)"; mod="$(stat -f %m "$1" 2>/dev/null)"
+    case "$born$mod" in ''|*[!0-9]*) born="" ;; esac
+    if [ -n "$born" ] && [ "$born" -gt 0 ] && [ "$born" -lt "$mod" ]; then
+      touch -t "$(date -r "$born" '+%Y%m%d%H%M.%S')" "$2" 2>/dev/null
+    fi
+    if command -v xattr >/dev/null 2>&1; then
+      xattr "$1" 2>/dev/null | while IFS= read -r a; do
+        [ -n "$a" ] && xattr -wx "$a" "$(xattr -px "$a" "$1" | tr -d ' \n')" "$2" 2>/dev/null
+      done
+    fi
+  fi
+  touch -r "$1" "$2"
+}
+
 # Size in bytes and modification time (seconds since 1970) of file $1: "<size> <mtime>".
 file_stat() {
   # GNU stat first: on Linux "stat -f" means something else and does not fail.
   stat -c '%s %Y' "$1" 2>/dev/null || stat -f '%z %m' "$1" 2>/dev/null
+}
+
+local_day() {        # seconds since 1970 -> 2026-11-19 (this Mac's time zone)
+  date -r "$1" '+%Y-%m-%d' 2>/dev/null || date -d "@$1" '+%Y-%m-%d'
 }
 
 iso_utc() {          # seconds since 1970 -> 2026-11-19T14:05:12Z
@@ -255,7 +342,7 @@ audio_name() {
 
 # The copy plan: one line per file, "<file on card><TAB><path inside the destination>".
 build_plan() {
-  local type="$1" src="$2" f d dn num label i=0 n
+  local type="$1" src="$2" f d dn num label
   local dirs=()
   if [ "$type" = camera ]; then
     if [ "$VIDEO_MODE" = clips ]; then
@@ -265,19 +352,18 @@ build_plan() {
     fi
     return
   fi
+  # The takes and the room tone were chosen when the offload started.
   local day
-  for day in $REC_DAYS; do
-    for d in "$src"/"${day}"_[0-9][0-9][0-9]"$AUDIO_TAKE_SUFFIX"; do [ -d "$d" ] && dirs+=("$d"); done
-  done
-  n=${#dirs[@]}
+  while IFS= read -r dn; do
+    [ -n "$dn" ] && [ -d "$src/$dn" ] && dirs+=("$src/$dn")
+  done <<< "$DIT_RUN_TAKES"
   for d in "${dirs[@]}"; do
-    i=$((i + 1))
     dn="$(basename "$d")"
     day="${dn%%_*}"
-    num="${dn#"${day}"_}"; num="${num%"$AUDIO_TAKE_SUFFIX"}"
+    num="$(take_number "$dn")"
     # shellcheck disable=SC2059
     label="$(printf "$AUDIO_TAKE_LABEL" $((10#$num)))"
-    [ "$AUDIO_ROOMTONE" = last ] && [ "$n" -ge 2 ] && [ "$i" = "$n" ] && label="RoomTone"
+    [ "$dn" = "$DIT_RUN_ROOMTONE" ] && label="RoomTone"
     find "$d" -maxdepth 1 -type f ! -name '.*' | sort | while IFS= read -r f; do
       printf '%s\t%s/%s\n' "$f" "$dn" "$(audio_name "$(basename "$f")" "${day}_$num" "$label")"
     done
@@ -293,7 +379,8 @@ copy_one() {
   [ -e "$2" ] && return 0
   mkdir -p "$(dirname "$2")"
   rm -f "$2.dit-part"                 # an unfinished copy from an earlier run, never a real file
-  cp -p "$1" "$2.dit-part" && mv -n "$2.dit-part" "$2"
+  cp -p "$1" "$2.dit-part" && mv -n "$2.dit-part" "$2" || return 1
+  [ "$KEEP_FILE_INFO" = no ] || copy_dates "$1" "$2"
 }
 
 copy_from_card() {   # into folder $1
@@ -312,26 +399,29 @@ copy_between() {     # from folder $1 into folder $2
   return $rc
 }
 
-# Both checksum functions note their progress in their last argument's file, for "status":
-# "<KB checksummed so far><TAB><KB of the current file><TAB><current file>".
-hash_card() {        # checksums of the files on the card, into file $1
+# The checksum functions note their progress in a file, for "status":
+# "<KB checksummed so far><TAB><KB of the current file><TAB><current file>",
+# and the checks of copies note when each file was checked: "<time><TAB><path>".
+hash_card() {        # checksums of the files on the card into file $1, progress in $2
   local s r h k sofar=0
   {
     while IFS=$'\t' read -r k s r; do
       printf '%s\t%s\t%s\n' "$sofar" "$k" "$s" > "$2"
-      h="$(hash_of "$s")"; printf '%s  %s\n' "${h:-UNREADABLE}" "$r"
+      h="$(fresh_hash "$s")"; printf '%s  %s\n' "${h:-UNREADABLE}" "$r"
       sofar=$((sofar + k))
     done
     printf '%s\t0\t\n' "$sofar" > "$2"
   } < <(paste "$SIZES" "$PLAN") | sort > "$1"
 }
 
-hash_dest() {        # checksums of the copies in folder $1, into file $2
+hash_dest() {        # copies in folder $1: checksums into $2, progress in $3, times in $4
   local s r h k sofar=0
+  : > "$4"
   {
     while IFS=$'\t' read -r k s r; do
       printf '%s\t%s\t%s\n' "$sofar" "$k" "$1/$r" > "$3"
-      h="$(hash_of "$1/$r")"; printf '%s  %s\n' "${h:-MISSING}" "$r"
+      h="$(fresh_hash "$1/$r")"; printf '%s  %s\n' "${h:-MISSING}" "$r"
+      printf '%s\t%s\n' "$(date +%s)" "$r" >> "$4"
       sofar=$((sofar + k))
     done
     printf '%s\t0\t\n' "$sofar" > "$3"
@@ -361,7 +451,7 @@ copy_parallel() {
       if [ $rc = 0 ] && [ -n "$h" ]; then
         for d in "${outs[@]}"; do
           # Only a complete copy gets its real name; nothing existing is replaced.
-          mv -n "$d" "${d%.dit-part}" && touch -r "$s" "${d%.dit-part}"
+          mv -n "$d" "${d%.dit-part}" && copy_dates "$s" "${d%.dit-part}"
         done
       else
         say "  copy error on $r: left as .dit-part and treated as missing"
@@ -378,15 +468,18 @@ copy_parallel() {
   sort "$CARD_LIST.unsorted" > "$CARD_LIST"
 }
 
-# Checksum the copies in folder $1 as they arrive, into file $2, progress in file $3.
+# Checksum the copies in folder $1 as they arrive: checksums into $2, progress in $3,
+# times in $4.
 hash_following() {
   local s r h k sofar=0 idx=0
+  : > "$4"
   {
     while IFS=$'\t' read -r k s r; do
       idx=$((idx + 1))
       until [ "$(wc -l < "$COPIED" | tr -d ' ')" -ge $idx ] || [ -e "$COPIED.done" ]; do sleep 1; done
       printf '%s\t%s\t%s\n' "$sofar" "$k" "$1/$r" > "$3"
-      h="$(hash_of "$1/$r")"; printf '%s  %s\n' "${h:-MISSING}" "$r"
+      h="$(fresh_hash "$1/$r")"; printf '%s  %s\n' "${h:-MISSING}" "$r"
+      printf '%s\t%s\n' "$(date +%s)" "$r" >> "$4"
       sofar=$((sofar + k))
     done
     printf '%s\t0\t\n' "$sofar" > "$3"
@@ -408,8 +501,15 @@ write_list() {       # destination folder, verified list, stamp
   cp -n "$2" "$f" 2>/dev/null && echo "$f"
 }
 
+# When file $2 was checked, from times file $1 (falls back to $3).
+check_time() {
+  local t
+  [ -f "$1" ] && t="$(awk -F'\t' -v r="$2" '$2 == r { t = $1 } END { print t }' "$1")"
+  echo "${t:-$3}"
+}
+
 # Classic MHL (version 1.1), the format OffShoot, Silverstack and the mhl tool read.
-write_mhl() {        # destination folder, verified list, start, finish
+write_mhl() {        # destination folder, verified list, start, finish, check times
   local dir="$1" f h r size mtime el now line
   f="$dir/$(basename "$dir")_$(date '+%Y-%m-%d_%H%M%S').mhl"
   [ ! -e "$f" ] || return 1
@@ -433,7 +533,7 @@ write_mhl() {        # destination folder, verified list, start, finish
       echo "    <size>${size:-0}</size>"
       echo "    <lastmodificationdate>$(iso_utc "${mtime:-0}")</lastmodificationdate>"
       echo "    <$el>$h</$el>"
-      echo "    <hashdate>$now</hashdate>"
+      echo "    <hashdate>$(iso_utc "$(check_time "$5" "$r" "$4")")</hashdate>"
       echo '  </hash>'
     done < "$2"
     echo '</hashlist>'
@@ -441,7 +541,7 @@ write_mhl() {        # destination folder, verified list, start, finish
 }
 
 # ASC MHL (version 2.0): a new generation in the folder's ascmhl history, plus the chain file.
-write_ascmhl() {     # destination folder, verified list, start, finish
+write_ascmhl() {     # destination folder, verified list, start, finish, check times
   local dir="$1" hist="$1/ascmhl" seq=0 n g f chain h r size mtime action now esc line
   mkdir -p "$hist" || return 1
   for g in "$hist"/[0-9][0-9][0-9][0-9]_*.mhl; do
@@ -477,7 +577,7 @@ write_ascmhl() {     # destination folder, verified list, start, finish
       [ $seq = 1 ] || ! grep -qF ">$esc</path>" "$hist"/[0-9][0-9][0-9][0-9]_*.mhl 2>/dev/null || action=verified
       echo '    <hash>'
       echo "      <path size=\"${size:-0}\" lastmodificationdate=\"$(iso_utc "${mtime:-0}")\">$esc</path>"
-      echo "      <$(hash_name ascmhl) action=\"$action\" hashdate=\"$now\">$h</$(hash_name ascmhl)>"
+      echo "      <$(hash_name ascmhl) action=\"$action\" hashdate=\"$(iso_utc "$(check_time "$5" "$r" "$4")")\">$h</$(hash_name ascmhl)>"
       echo '    </hash>'
     done < "$2"
     echo '  </hashes>'
@@ -499,6 +599,200 @@ write_ascmhl() {     # destination folder, verified list, start, finish
     echo '  </hashlist>'
     echo '</ascmhldirectory>'
   } > "$chain.tmp" && mv "$chain.tmp" "$chain" && echo "$f"
+}
+
+# ---------- offload report ----------
+
+# Record a finished offload for the report: $STATE/reports/<project>/<day>/<job>-<start>.rec
+# (key=value lines) and .files ("<bytes><TAB><checksum><TAB><path>" lines).
+record_job() {       # job, result, card, started, finished, mode, verified list, destinations...
+  local job="$1" result="$2" src="$3" started="$4" finished="$5" mode="$6" list="$7"
+  local dir rec s r size mtime d
+  shift 7
+  dir="$STATE/reports/$PROJECT/$DAY_ISO"
+  mkdir -p "$dir" || return 0
+  rec="$dir/$job-$started"
+  while IFS=$'\t' read -r s r; do
+    read -r size mtime <<< "$(file_stat "$s")"
+    printf '%s\t%s\n' "${size:-0}" "$r"
+  done < "$PLAN" > "$rec.sizes"
+  if [ -s "$list" ]; then
+    awk -F'\t' 'NR == FNR { i = index($0, "  "); h[substr($0, i + 2)] = substr($0, 1, i - 1); next }
+                { print $1 "\t" ($2 in h ? h[$2] : "-") "\t" $2 }' "$list" "$rec.sizes" > "$rec.files"
+  else
+    awk -F'\t' '{ print $1 "\t-\t" $2 }' "$rec.sizes" > "$rec.files"
+  fi
+  rm -f "$rec.sizes"
+  {
+    echo "job=$job"
+    echo "result=$result"
+    echo "card=$src"
+    echo "started=$started"
+    echo "finished=$finished"
+    echo "mode=$mode"
+    echo "algo=$HASH_ALGO"
+    echo "files=$(wc -l < "$rec.files" | tr -d ' ')"
+    echo "bytes=$(awk -F'\t' '{ n += $1 } END { printf "%.0f", n }' "$rec.files")"
+    echo "host=$(hostname -s)"
+    echo "user=${USER:-unknown}"
+    echo "version=$VERSION"
+    [ -z "$REC_REASON" ] || echo "reason=$REC_REASON"
+    for d in "$@"; do echo "dest=$d"; done
+  } > "$rec.rec"
+  write_reports "$dir"
+}
+
+rec_val() { sed -n "s/^$2=//p" "$1" | head -1; }
+
+bytes_text() {       # 1536 -> "1.5 KB"
+  awk -v b="$1" 'BEGIN {
+    if (b >= 1073741824) printf "%.1f GB", b / 1073741824
+    else if (b >= 1048576) printf "%.1f MB", b / 1048576
+    else if (b >= 1024) printf "%.1f KB", b / 1024
+    else printf "%d bytes", b }'
+}
+
+speed_text() {       # bytes, seconds -> "113.6 MB/s"
+  [ "${2:-0}" -gt 0 ] || { echo "-"; return; }
+  echo "$(bytes_text $(($1 / $2)))/s"
+}
+
+clock() { date -r "$1" '+%H:%M:%S' 2>/dev/null || date -d "@$1" '+%H:%M:%S'; }
+
+# The records of report folder $1, oldest first.
+report_recs() {
+  local r
+  for r in "$1"/*.rec; do
+    [ -f "$r" ] && printf '%s\t%s\n' "$(rec_val "$r" started)" "$r"
+  done | sort -n | cut -f2
+}
+
+report_overall() {   # "4 offloads, all passed" / "4 offloads: 3 passed, 1 FAILED (CAMB)"
+  local r n=0 bad=0 failed_jobs=""
+  while IFS= read -r r; do
+    n=$((n + 1))
+    if [ "$(rec_val "$r" result)" != PASS ]; then bad=$((bad + 1)); failed_jobs="$failed_jobs $(rec_val "$r" job)"; fi
+  done < <(report_recs "$1")
+  if [ $bad = 0 ]; then echo "$n offload$([ $n = 1 ] || echo s), all passed"
+  else echo "$n offload$([ $n = 1 ] || echo s): $((n - bad)) passed, $bad FAILED (${failed_jobs# })"; fi
+}
+
+report_text() {      # report folder, project, day label
+  local r job
+  echo "dit-offloader offload report"
+  echo "============================"
+  printf '%-11s %s\n' "Project:" "$2" "Shoot day:" "$3" "Machine:" "$(hostname -s)" \
+    "Updated:" "$(date '+%Y-%m-%d %H:%M %Z') (dit-offloader $VERSION)" "Overall:" "$(report_overall "$1")"
+  echo
+  echo "Every file was read back from every destination and its checksum compared with the card's."
+  echo
+  printf '%-8s %-6s %6s %10s  %-8s  %-8s  %8s  %12s  %-8s  %s\n' \
+    Card Result Files Size Started Finished Time Speed Copying Checksum
+  while IFS= read -r r; do
+    local st fin by
+    st="$(rec_val "$r" started)"; fin="$(rec_val "$r" finished)"; by="$(rec_val "$r" bytes)"
+    printf '%-8s %-6s %6s %10s  %-8s  %-8s  %8s  %12s  %-8s  %s\n' "$(rec_val "$r" job)" \
+      "$(rec_val "$r" result)" "$(rec_val "$r" files)" "$(bytes_text "$by")" "$(clock "$st")" \
+      "$(clock "$fin")" "$(time_text $((fin - st)))" "$(speed_text "$by" $((fin - st)))" \
+      "$(rec_val "$r" mode)" "$(rec_val "$r" algo)"
+  done < <(report_recs "$1")
+  while IFS= read -r r; do
+    job="$(rec_val "$r" job)"
+    echo
+    echo "$job: $(rec_val "$r" result), from $(rec_val "$r" card)"
+    [ -z "$(rec_val "$r" reason)" ] || echo "  Why: $(rec_val "$r" reason)"
+    echo "  Destinations:"
+    sed -n 's/^dest=/    /p' "$r"
+    echo "  Files ($(rec_val "$r" algo) checksums):"
+    awk -F'\t' '{ printf "    %-44s %14s  %s\n", $3, $1 " bytes", $2 }' "${r%.rec}.files"
+  done < <(report_recs "$1")
+}
+
+report_html() {      # report folder, project, day label
+  local r job res st fin by path
+  e() { xml_escape "$1"; }
+  cat <<HEAD
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Offload report: $(e "$2") $(e "$3")</title>
+<style>
+  body { font: 14px/1.45 -apple-system, "Helvetica Neue", Arial, sans-serif; color: #1d1d1f; margin: 32px auto; max-width: 1100px; padding: 0 24px; }
+  h1 { font-size: 22px; margin: 0 0 4px; } h2 { font-size: 16px; margin: 28px 0 8px; }
+  .meta { color: #555; margin: 0 0 18px; } .meta b { color: #1d1d1f; }
+  table { border-collapse: collapse; width: 100%; } th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #e3e3e6; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .03em; color: #666; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; } code { font: 12px Menlo, monospace; }
+  .pass { color: #0a7a2f; font-weight: 600; } .fail { color: #c1121f; font-weight: 600; }
+  details { margin: 8px 0 14px; } summary { cursor: pointer; font-weight: 600; }
+  .note { color: #555; font-size: 13px; }
+  @media print { body { margin: 0; } details { break-inside: avoid; } details:not([open]) > *:not(summary) { display: block; } }
+</style>
+</head>
+<body>
+<h1>Offload report</h1>
+<p class="meta"><b>Project</b> $(e "$2") &nbsp;·&nbsp; <b>Shoot day</b> $(e "$3") &nbsp;·&nbsp; <b>Machine</b> $(e "$(hostname -s)") &nbsp;·&nbsp; <b>Updated</b> $(date '+%Y-%m-%d %H:%M %Z')</p>
+<p><b>$(e "$(report_overall "$1")")</b></p>
+<p class="note">Every file was read back from every destination and its checksum compared with the card's.</p>
+<table>
+<tr><th>Card</th><th>Result</th><th>Files</th><th>Size</th><th>Started</th><th>Finished</th><th>Time</th><th>Speed</th><th>Copying</th><th>Checksum</th></tr>
+HEAD
+  while IFS= read -r r; do
+    st="$(rec_val "$r" started)"; fin="$(rec_val "$r" finished)"; by="$(rec_val "$r" bytes)"
+    res="$(rec_val "$r" result)"
+    printf '<tr><td>%s</td><td class="%s">%s</td><td class="num">%s</td><td class="num">%s</td><td>%s</td><td>%s</td><td class="num">%s</td><td class="num">%s</td><td>%s</td><td>%s</td></tr>\n' \
+      "$(e "$(rec_val "$r" job)")" "$([ "$res" = PASS ] && echo pass || echo fail)" "$(e "$res")" \
+      "$(rec_val "$r" files)" "$(bytes_text "$by")" "$(clock "$st")" "$(clock "$fin")" \
+      "$(time_text $((fin - st)))" "$(speed_text "$by" $((fin - st)))" "$(e "$(rec_val "$r" mode)")" "$(e "$(rec_val "$r" algo)")"
+  done < <(report_recs "$1")
+  echo '</table>'
+  while IFS= read -r r; do
+    job="$(rec_val "$r" job)"; res="$(rec_val "$r" result)"
+    echo "<h2>$(e "$job") <span class=\"$([ "$res" = PASS ] && echo pass || echo fail)\">$(e "$res")</span></h2>"
+    [ -z "$(rec_val "$r" reason)" ] || echo "<p class=\"fail\">$(e "$(rec_val "$r" reason)")</p>"
+    echo "<p class=\"note\">From $(e "$(rec_val "$r" card)"), to:</p><ul>"
+    sed -n 's/^dest=//p' "$r" | while IFS= read -r d; do echo "<li><code>$(e "$d")</code></li>"; done
+    echo "</ul>"
+    echo "<details><summary>$(rec_val "$r" files) files, $(e "$(rec_val "$r" algo)") checksums</summary>"
+    echo "<table><tr><th>File</th><th>Size (bytes)</th><th>Checksum</th></tr>"
+    while IFS=$'\t' read -r by st path; do
+      echo "<tr><td><code>$(e "$path")</code></td><td class=\"num\">$by</td><td><code>$(e "$st")</code></td></tr>"
+    done < "${r%.rec}.files"
+    echo "</table></details>"
+  done < <(report_recs "$1")
+  echo '</body>'
+  echo '</html>'
+}
+
+# An offload that ends before copying anything: recorded for the report with the reason.
+record_early() {     # reason (cmd_run's job, src, run_start and dests are in scope)
+  REC_REASON="$1" record_job "$job" FAIL "$src" "$run_start" "$(date +%s)" \
+    "${DIT_RUN_COPY_MODE:-$COPY_MODE}" /dev/null "${dests[@]}"
+}
+
+# Rebuild the report of report folder $1 and save it on this offload's destinations.
+write_reports() {
+  local dir="$1" fmt ext root rdir f i=0
+  [ "$REPORT_FORMAT" != none ] || return 0
+  until mkdir "$dir/.lock" 2>/dev/null; do
+    i=$((i + 1)); [ $i -lt 30 ] || break; sleep 1
+  done
+  for fmt in $REPORT_FORMAT; do
+    case "$fmt" in text) ext=txt ;; html) ext=html ;; *) continue ;; esac
+    "report_$fmt" "$dir" "$PROJECT" "$DATE_LABEL" > "$dir/report.$ext"
+    for root in "${ROOTS[@]}"; do
+      rdir="$root/$(fill "$REPORT_PATH" "")"
+      f="$rdir/${DATE_LABEL}_${PROJECT}_offload-report.$ext"
+      # The report is dit-offloader's own file, rebuilt as each card finishes.
+      if mkdir -p "$rdir" && cp "$dir/report.$ext" "$f.tmp$$" && mv -f "$f.tmp$$" "$f"; then
+        say "  report updated: $f"
+      else
+        rm -f "$f.tmp$$"; say "  note: could not save the report in $rdir"
+      fi
+    done
+  done
+  rmdir "$dir/.lock" 2>/dev/null
 }
 
 free_kb() {
@@ -535,15 +829,21 @@ space_needed() {
 
 # Offloads that start together check free space one at a time.
 lock_space() {
-  local i=0
+  local i=0 owner
   until mkdir "$STATE/space.lock" 2>/dev/null; do
+    # Left behind by an offload that was stopped while it held the lock: clear it.
+    owner="$(cat "$STATE/space.lock/pid" 2>/dev/null)"
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -f "$STATE/space.lock/pid"; rmdir "$STATE/space.lock" 2>/dev/null; continue
+    fi
     i=$((i + 1))
     [ $i -lt 120 ] || { say "  note: another offload held the free space check for 2 minutes; going ahead"; return 0; }
     sleep 1
   done
+  echo $$ > "$STATE/space.lock/pid"
 }
 
-unlock_space() { rmdir "$STATE/space.lock" 2>/dev/null; }
+unlock_space() { rm -f "$STATE/space.lock/pid"; rmdir "$STATE/space.lock" 2>/dev/null; }
 
 # ---------- commands ----------
 
@@ -598,6 +898,28 @@ AUDIO_PATH='{project}/Audio/{date}'
 #             '%Y%m%d'   gives 20261119
 DATE_FORMAT='%Y-%m-%d'
 
+# SHOOT_DAY: which day {date} is, and which day's audio takes are taken.
+#   today  = this Mac's date when you run "start" (default)
+#   cutoff = like today, but an offload started before DAY_STARTS_AT counts as the
+#            previous day's shoot. Uses only this Mac's clock.
+#   clips  = each card's own date: the clips' dates (camera cards) or the take names
+#            (audio cards). Relies on the camera's and recorder's clocks.
+#   ask    = shows this Mac's date and each card's dates, and asks. Needs a terminal
+#            window; without one it uses today and says so.
+#   "start --day YYYY-MM-DD" always wins over this setting.
+SHOOT_DAY="today"
+
+# DAY_STARTS_AT: with SHOOT_DAY="cutoff", the time a new shoot day begins, as HH:MM.
+#   Default: "05:00", so an offload started at 1 a.m. belongs to the day before.
+DAY_STARTS_AT="05:00"
+
+# DAY_CHECK: compare the shoot day with the dates on each card (from the camera's or
+#   recorder's clock, which may be wrong; a mismatch can also mean a late offload).
+#   warn = say so and go ahead (default)
+#   stop = say so and do not start that card; start it again with --day
+#   off  = do not compare
+DAY_CHECK="warn"
+
 
 # ===== Camera cards =====
 
@@ -648,8 +970,16 @@ AUDIO_ENABLED="yes"
 # AUDIO_TAKE_SUFFIX: the ending of the recorder's take folders, which are named
 #   YYMMDD_NNN plus this ending, e.g. 261119_001.TAKE.
 #   Default: ".TAKE"
-#   Only takes dated the shoot day are copied (add --overnight for the day after too).
 AUDIO_TAKE_SUFFIX=".TAKE"
+
+# AUDIO_TAKES: which takes on an audio card are offloaded. Takes inside folders are never
+#   taken, only those at the top level of the card.
+#   day = takes whose names carry the shoot day's date (default). With "start --overnight",
+#         the next day's too. Relies on the recorder's clock.
+#   all = every take at the top level of the card, whatever its date
+#   ask = shows the dates on the card and asks which. Needs a terminal window; without
+#         one it takes the shoot day's.
+AUDIO_TAKES="day"
 
 # AUDIO_RENAME: rename the audio files on the copies. The card itself is never changed.
 #   yes = rename using AUDIO_NAME, AUDIO_TAKE_LABEL, AUDIO_ROOMTONE and AUDIO_TRACKS
@@ -668,9 +998,19 @@ AUDIO_NAME='{date}-{project}-{take}-{track}'
 #   Examples: 'Tk%02d' gives Tk01 (default)   'Take%d' gives Take1   'T%03d' gives T001
 AUDIO_TAKE_LABEL='Tk%02d'
 
-# AUDIO_ROOMTONE: label one take RoomTone instead of a take number.
-#   last = the day's last take is RoomTone, when there are at least two takes
-#   none = no RoomTone label (default)
+# AUDIO_ROOMTONE: which take is labelled RoomTone instead of a take number.
+#   none     = none (default)
+#   ask      = lists the takes being offloaded with their lengths and asks; Enter for none.
+#              Needs a terminal window; without one, no take is labelled.
+#   last     = the last take being offloaded, when there are at least two
+#   first    = the first take being offloaded, when there are at least two
+#   shortest = the shortest take, when there are at least two
+#   a number = that take number, e.g. "3"
+#   Override for one run with: start --roomtone last (or none, ask, 3...)
+#   If a take is already on a destination under other names (say an earlier offload
+#   labelled it differently), the audio card is not offloaded, so no take is stored twice.
+#   last, first and shortest look only at the takes in this offload: if the audio card is
+#   offloaded more than once a day, use ask or a number.
 AUDIO_ROOMTONE="none"
 
 # AUDIO_TRACKS: friendlier track names, as <recorder's name>=<name you want>, separated by
@@ -692,8 +1032,25 @@ AUDIO_TRACKS=""
 #              (SSDs, RAIDs); can be slower when several destinations share one spinning
 #              disk. Creation dates of the copies are the copy time (modification dates are
 #              kept).
+#   Parallel copying needs dit-offloader-evict, installed with dit-offloader by Homebrew:
+#   it makes each check read the copy from the drive, not from memory.
 #   Override for one run with: start --parallel   or   start --staged
 COPY_MODE="staged"
+
+# SOURCE_RECHECK: with COPY_MODE="parallel", read the card a second time after copying and
+#   compare the two reads. Parallel copying reads the card only once, so a card or reader
+#   that returns wrong data without reporting an error would otherwise give every copy the
+#   same wrong data. Staged copying always reads the card twice.
+#   yes = read it again; takes as long as one more read of the card
+#   no  = do not (default)
+SOURCE_RECHECK="no"
+
+# KEEP_FILE_INFO: what the copies keep besides their content and modification date.
+#   yes = also the card file's creation date and any extra Finder information (tags,
+#         comments). Without it, a copy's creation date is the clip's modification date,
+#         usually the end of the recording rather than its start. (default)
+#   no  = content and modification date only
+KEEP_FILE_INFO="yes"
 
 # HASH_ALGO: the checksum used to compare the card with every copy.
 #   md5    = the most widely supported (default)
@@ -725,6 +1082,38 @@ WATCH_ON_START="no"
 #   yes = eject (default). A card that is still mounted afterwards has not passed.
 #   no  = leave it mounted; eject later with: dit-offloader eject A
 AUTO_EJECT="yes"
+
+
+# ===== Watching, alerts and reports =====
+
+# TERMINAL_ALERTS: alerts in the Terminal window while the progress bars are showing
+#   (start with WATCH_ON_START, or status --watch) or while "dit-offloader wait" runs.
+#   Any of these, separated by spaces, or none:
+#   bell    = ring the Terminal bell once when a card passes, three times when one does
+#             not. Terminal can sound it, flash, mark the tab and bounce its Dock icon:
+#             Terminal > Settings > Profiles > Advanced > Bell. Over SSH it rings on the
+#             Mac you are typing on.
+#   title   = show the counts in the window and tab title, e.g.
+#             "dit-offloader: 2 running, 1 passed, 0 not passed"
+#   summary = end with one line saying how they ended, e.g. "ALL 4 PASSED" (default)
+#   Example: TERMINAL_ALERTS="bell title summary"
+TERMINAL_ALERTS="summary"
+
+# REPORT_FORMAT: an offload report per project and shoot day, listing each card, its
+#   result, files, sizes, times and checksums. Rebuilt as each card finishes and saved on
+#   the destinations (see REPORT_PATH). Also shown by: dit-offloader report
+#   html = a web page: opens in any browser and can be saved as PDF from there
+#   text = a plain text file
+#   "html text" = both
+#   none = no report (default)
+REPORT_FORMAT="none"
+
+# REPORT_PATH: the folder for the report inside each destination, with the same
+#   placeholders as VIDEO_PATH ({project}, {date}). The file is named
+#   <date>_<project>_offload-report.html (or .txt).
+#   Default: '{project}/Reports'
+#   Example: REPORT_PATH='{project}-Media/17-Reports'
+REPORT_PATH='{project}/Reports'
 TEMPLATE
 }
 
@@ -788,16 +1177,172 @@ is_destination() {   # is drive folder $1 a destination, or does it hold one?
   return 1
 }
 
+# ---------- choices made when "start" runs ----------
+
+# Can we ask a question? Not over "ssh host 'command'", which has no terminal.
+can_ask() { { : < /dev/tty; } 2>/dev/null; }
+
+ask() {              # prompt -> the answer typed
+  local ans
+  printf '%s' "$1" > /dev/tty
+  IFS= read -r ans < /dev/tty
+  echo "$ans"
+}
+
+day_after() { date -j -v+1d -f '%Y-%m-%d' "$1" '+%Y-%m-%d' 2>/dev/null || date -d "$1 + 1 day" '+%Y-%m-%d'; }
+day_before() { date -j -v-1d -f '%Y-%m-%d' "$1" '+%Y-%m-%d' 2>/dev/null || date -d "$1 - 1 day" '+%Y-%m-%d'; }
+
+# SHOOT_DAY=cutoff: before DAY_STARTS_AT, it is still the previous day's shoot.
+cutoff_day() {
+  local now today
+  now="$(date '+%H%M')"; today="$(date '+%Y-%m-%d')"
+  if [ $((10#$now)) -lt $((10#${DAY_STARTS_AT/:/})) ]; then day_before "$today"; else echo "$today"; fi
+}
+
+# The dates of the material on card $1: "YYYY-MM-DD<TAB>count" lines, most common first.
+# Camera cards: the clips' modification dates. Audio cards: the dates in the take names.
+card_days() {
+  local f size mtime
+  if is_audio_card "$1"; then
+    for f in "$1"/$(take_glob); do
+      [ -d "$f" ] || continue
+      f="$(basename "$f")"; echo "20${f:0:2}-${f:2:2}-${f:4:2}"
+    done
+  else
+    clip_files "$1" | while IFS= read -r f; do
+      read -r size mtime <<< "$(file_stat "$f")"; local_day "${mtime:-0}"
+    done
+  fi | sort | uniq -c | sort -k1,1nr -k2,2 | awk '{ print $2 "\t" $1 }'
+}
+
+days_text() {        # card_days lines -> "2026-11-17 (2 files), 2026-11-16 (1)"
+  awk -F'\t' '{ printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2 } END { print "" }'
+}
+
+# SHOOT_DAY=ask: show the Mac's date and the cards' dates, and ask.
+ask_day() {
+  local today v ans i=0
+  today="$(date '+%Y-%m-%d')"
+  if ! can_ask; then
+    echo "Note: SHOOT_DAY=ask, but there is no terminal to ask in; using today, $today. Pass --day to choose." >&2
+    echo "$today"; return
+  fi
+  {
+    echo "Which day was this shot?"
+    echo "  This Mac's date: $today"
+    for v in "$@"; do echo "  $(basename "$v"): $(card_days "$v" | days_text)"; done
+  } > /dev/tty
+  while [ $i -lt 3 ]; do
+    ans="$(ask "Shoot day as YYYY-MM-DD (Enter for $today): ")"
+    [ -n "$ans" ] || ans="$today"
+    if DAY_ISO="$ans" fmt_day '%Y' >/dev/null 2>&1; then echo "$ans"; return; fi
+    echo "  \"$ans\" is not a date like 2026-11-17." > /dev/tty
+    i=$((i + 1))
+  done
+  die "no shoot day given"
+}
+
+# The audio takes to offload from card $1 (folder names, one per line), by AUDIO_TAKES.
+choose_takes() {
+  local src="$1" all days ans f d
+  all="$(for f in "$src"/$(take_glob); do [ -d "$f" ] && basename "$f"; done)"
+  days="$(fmt_day '%y%m%d')"
+  [ "$OVERNIGHT" = yes ] && days="$days $(DAY_ISO="$(day_after "$DAY_ISO")" fmt_day '%y%m%d')"
+  case "$AUDIO_TAKES" in
+    all) echo "$all"; return ;;
+    ask)
+      if can_ask; then
+        {
+          echo "Takes on $(basename "$src"), by the date in their names:"
+          printf '%s\n' "$all" | cut -c1-6 | sort | uniq -c | awk '{ printf "  %s: %d take(s)\n", $2, $1 }'
+        } > /dev/tty
+        ans="$(ask "Which takes? Enter for the shoot day's (${days% *}), \"all\", or a day as YYMMDD: ")"
+        case "$ans" in
+          "") ;;
+          all) echo "$all"; return ;;
+          [0-9][0-9][0-9][0-9][0-9][0-9]) days="$ans" ;;
+          *) die "\"$ans\" is not \"all\" or a day as YYMMDD" ;;
+        esac
+      else
+        echo "Note: AUDIO_TAKES=ask, but there is no terminal to ask in; taking the shoot day's takes." >&2
+      fi ;;
+  esac
+  printf '%s\n' "$all" | while IFS= read -r f; do
+    for d in $days; do case "$f" in "${d}_"*) echo "$f" ;; esac; done
+  done
+}
+
+take_length() {      # take folder -> "3m12s" (from its first recording), or its size
+  local f secs
+  f="$(find "$1" -maxdepth 1 -type f ! -name '.*' | sort | head -1)"
+  if [ -n "$f" ] && command -v afinfo >/dev/null 2>&1; then
+    secs="$(afinfo "$f" 2>/dev/null | awk '/estimated duration/ { printf "%d", $3 }')"
+    [ -z "$secs" ] || { time_text "$secs"; return; }
+  fi
+  kb_text "$(du -sk "$1" | cut -f1)"
+}
+
+# Which of the takes (folder names, one per line in $2) on card $1 is the room tone,
+# by AUDIO_ROOMTONE or --roomtone. Prints the folder name, or nothing.
+choose_roomtone() {
+  local src="$1" takes="$2" choice="${ROOMTONE_CHOICE:-$AUDIO_ROOMTONE}" n t ans
+  n="$(printf '%s\n' "$takes" | grep -c .)"
+  case "$choice" in
+    none) ;;
+    last)  [ "$n" -ge 2 ] && printf '%s\n' "$takes" | tail -1 ;;
+    first) [ "$n" -ge 2 ] && printf '%s\n' "$takes" | head -1 ;;
+    shortest)
+      [ "$n" -ge 2 ] || return 0
+      printf '%s\n' "$takes" | while IFS= read -r t; do
+        printf '%s\t%s\n' "$(du -sk "$src/$t" | cut -f1)" "$t"
+      done | sort -n | head -1 | cut -f2 ;;
+    ask)
+      if ! can_ask; then
+        echo "Note: AUDIO_ROOMTONE=ask, but there is no terminal to ask in; no take is labelled RoomTone." >&2
+        return 0
+      fi
+      {
+        echo "Takes to offload from $(basename "$src"):"
+        printf '%s\n' "$takes" | while IFS= read -r t; do
+          printf '  take %3d   %-22s %s\n' $((10#$(take_number "$t"))) "$t" "$(take_length "$src/$t")"
+        done
+      } > /dev/tty
+      ans="$(ask "Which take is the room tone? Take number, or Enter for none: ")"
+      [ -n "$ans" ] || return 0
+      case "$ans" in *[!0-9]*) die "\"$ans\" is not a take number" ;; esac
+      take_numbered "$takes" "$ans" ;;
+    *) take_numbered "$takes" "$choice" ;;
+  esac
+}
+
+take_numbered() {    # takes (one per line), number -> the take with that number
+  local t
+  t="$(printf '%s\n' "$1" | while IFS= read -r t; do
+    [ -n "$t" ] && [ $((10#$(take_number "$t"))) = $((10#$2)) ] && echo "$t"; done | head -1)"
+  if [ -n "$t" ]; then echo "$t"
+  else echo "Note: take $2 is not among the takes being offloaded; no take is labelled RoomTone." >&2; fi
+}
+
+take_number() {      # 261117_003.TAKE -> 003
+  local n="${1#*_}"; echo "${n%"$AUDIO_TAKE_SUFFIX"}"
+}
+
 cmd_start() {
   need_mac; load_config
-  local card="" cam="" v name any=0 failed=0 project=""
-  EXTRA=(); DAY_ISO="$(date '+%Y-%m-%d')"; OVERNIGHT=no
+  local card="" cam="" v name failed=0 project="" day_given=no cards=()
+  EXTRA=(); DAY_ISO=""; OVERNIGHT=no; ROOMTONE_CHOICE=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --to)   [ -n "$2" ] || die "--to needs a drive name"; EXTRA+=("$2"); shift 2 ;;
       --card) [ -n "$2" ] || die "--card needs a card name"; card="$2"; shift 2 ;;
       --cam)  [ -n "$2" ] || die "--cam needs a camera id"; cam="$2"; shift 2 ;;
-      --day)  [ -n "$2" ] || die "--day needs a date"; DAY_ISO="$2"; shift 2 ;;
+      --day)  [ -n "$2" ] || die "--day needs a date"; DAY_ISO="$2"; day_given=yes; shift 2 ;;
+      --roomtone)
+        case "$2" in
+          none|ask|last|first|shortest) ;;
+          ""|*[!0-9]*) die "--roomtone needs none, ask, last, first, shortest or a take number" ;;
+        esac
+        ROOMTONE_CHOICE="$2"; shift 2 ;;
       --overnight) OVERNIGHT=yes; shift ;;
       --parallel) COPY_MODE=parallel; shift ;;
       --staged)   COPY_MODE=staged; shift ;;
@@ -811,24 +1356,47 @@ cmd_start() {
   [ -n "$PROJECT" ] || die "no project name. Use: dit-offloader start <project>, or set PROJECT in $CONFIG"
   case "$PROJECT" in */*) die "project name cannot contain a slash" ;; esac
   [ -z "$cam" ] || [ -n "$card" ] || die "--cam needs --card, so it is clear which card it is for"
-  DATE_LABEL="$(fmt_day "$DATE_FORMAT")" || die "could not understand the day \"$DAY_ISO\" (use YYYY-MM-DD)"
+  if [ "$COPY_MODE" = parallel ] && [ -z "$EVICT_BIN" ]; then
+    die "parallel copying needs dit-offloader-evict, which is installed with dit-offloader by Homebrew (brew reinstall dit-offloader). Or copy in stages: --staged"
+  fi
   resolve_destinations
-  echo "Project: $PROJECT   Day: $DATE_LABEL   Destinations: ${#ROOTS[@]}   Copying: $COPY_MODE"
+
+  # The cards to offload.
+  if [ -n "$card" ]; then
+    cards=("$VOLROOT/$card")
+  else
+    for v in "$VOLROOT"/*; do
+      [ -d "$v" ] && [ ! -L "$v" ] || continue
+      is_destination "$v" && continue
+      if is_audio_card "$v" || is_camera_card "$v"; then cards+=("$v"); fi
+    done
+    [ ${#cards[@]} -gt 0 ] || die "no camera or audio card found (see: dit-offloader list)"
+  fi
+
+  # The shoot day: --day, or as SHOOT_DAY says (with "clips", each card's own).
+  if [ $day_given = no ]; then
+    case "$SHOOT_DAY" in
+      today)  DAY_ISO="$(date '+%Y-%m-%d')" ;;
+      cutoff) DAY_ISO="$(cutoff_day)" ;;
+      ask)    DAY_ISO="$(ask_day "${cards[@]}")" || exit 1 ;;
+      clips)  DAY_ISO="" ;;
+    esac
+  fi
+  if [ -n "$DAY_ISO" ]; then
+    DATE_LABEL="$(fmt_day "$DATE_FORMAT")" || die "could not understand the day \"$DAY_ISO\" (use YYYY-MM-DD)"
+    echo "Project: $PROJECT   Day: $DATE_LABEL   Destinations: ${#ROOTS[@]}   Copying: $COPY_MODE"
+  else
+    echo "Project: $PROJECT   Day: each card's, from its clips   Destinations: ${#ROOTS[@]}   Copying: $COPY_MODE"
+  fi
   for v in "${ROOTS[@]}"; do echo "  $v"; done
 
   if [ -n "$card" ]; then
     ( start_one "$card" "$cam" ) || exit 1
   else
-    for v in "$VOLROOT"/*; do
-      [ -d "$v" ] && [ ! -L "$v" ] || continue
-      is_destination "$v" && continue
-      if is_audio_card "$v" || is_camera_card "$v"; then
-        any=1
-        echo "--- $(basename "$v")"
-        ( start_one "$(basename "$v")" "" ) || failed=$((failed + 1))
-      fi
+    for v in "${cards[@]}"; do
+      echo "--- $(basename "$v")"
+      ( start_one "$(basename "$v")" "" ) || failed=$((failed + 1))
     done
-    [ $any = 1 ] || die "no camera or audio card found (see: dit-offloader list)"
   fi
   [ $failed = 0 ] || echo "ERROR: $failed card(s) did not start; see the messages above" >&2
   if [ "$WATCH_ON_START" = yes ] && [ "$(running_jobs)" -gt 0 ]; then
@@ -851,9 +1419,35 @@ start_one() {
   is_destination "$src" && die "$card is a destination, not a card"
   ls "$src" >/dev/null 2>&1 || die "cannot read $src. If you are connected over SSH, turn on \"Allow full disk access for remote users\" in System Settings > General > Sharing > Remote Login"
 
+  # The day: SHOOT_DAY=clips takes the card's own (its most common date).
+  local days
+  days="$(card_days "$src")"
+  if [ -z "$DAY_ISO" ]; then
+    DAY_ISO="$(printf '%s\n' "$days" | head -1 | cut -f1)"
+    [ -n "$DAY_ISO" ] || { DAY_ISO="$(date '+%Y-%m-%d')"; echo "Note: no dates found on $card; using today"; }
+    DATE_LABEL="$(fmt_day "$DATE_FORMAT")"
+    echo "Day: $DATE_LABEL (from the card)"
+  elif [ "$DAY_CHECK" != off ] && [ -n "$days" ] &&
+       ! printf '%s\n' "$days" | cut -f1 | grep -qx -e "$DAY_ISO" -e "$([ "$OVERNIGHT" = yes ] && day_after "$DAY_ISO")"; then
+    # The card's dates come from the camera's or recorder's clock, which may be wrong;
+    # a mismatch may also mean an offload after midnight. Either way, worth a look.
+    echo "Note: $card is dated $(printf '%s\n' "$days" | days_text), not the shoot day $DAY_ISO."
+    if [ "$DAY_CHECK" = stop ]; then
+      die "$card not started (DAY_CHECK=stop). If $DAY_ISO is right, the card's clock may be wrong: start it with --day $DAY_ISO. To file it under the card's date: --day $(printf '%s\n' "$days" | head -1 | cut -f1)"
+    fi
+    echo "      Going ahead with $DAY_ISO (DAY_CHECK=warn). To use the card's date, stop it and start it with --day $(printf '%s\n' "$days" | head -1 | cut -f1)"
+  fi
+
+  local takes="" roomtone=""
   if is_audio_card "$src"; then
     type=audio; job=AUDIO; cam=""
     echo "Audio card"
+    takes="$(choose_takes "$src")" || exit 1
+    if [ -z "$takes" ]; then
+      die "no takes dated $(fmt_day '%y%m%d') on $card (AUDIO_TAKES=$AUDIO_TAKES). Takes found: $(printf '%s\n' "$days" | days_text). Use --day, or AUDIO_TAKES=all or ask"
+    fi
+    roomtone="$(choose_roomtone "$src" "$takes")" || exit 1
+    echo "Takes: $(printf '%s\n' "$takes" | grep -c .) ($(printf '%s\n' "$takes" | head -1) to $(printf '%s\n' "$takes" | tail -1))   RoomTone: ${roomtone:-none}"
   else
     type=camera
     if [ -z "$cam" ]; then
@@ -886,7 +1480,8 @@ start_one() {
   set -m
   # shellcheck disable=SC2086
   DIT_RUN_PROJECT="$PROJECT" DIT_RUN_DAY="$DAY_ISO" DIT_RUN_ROOTS="$rootlist" DIT_RUN_CAM="$cam" \
-    DIT_RUN_OVERNIGHT="$OVERNIGHT" DIT_RUN_COPY_MODE="$COPY_MODE" \
+    DIT_RUN_OVERNIGHT="$OVERNIGHT" DIT_RUN_COPY_MODE="$COPY_MODE" DIT_RUN_TAKES="$takes" \
+    DIT_RUN_ROOMTONE="$roomtone" \
     nohup $keep "$SELF" _run "$job" "$type" "$card" > "$log" 2>&1 < /dev/null &
   echo $! > "$pidfile"
   set +m
@@ -895,12 +1490,10 @@ start_one() {
 
 cmd_run() {
   load_config
-  local job="$1" type="$2" src="$VOLROOT/$3" sub r i
+  local job="$1" type="$2" src="$VOLROOT/$3" sub r i run_start
+  run_start="$(date +%s)"
   PROJECT="$DIT_RUN_PROJECT"; DAY_ISO="$DIT_RUN_DAY"
-  DATE_LABEL="$(fmt_day "$DATE_FORMAT")"; REC_DAYS="$(fmt_day '%y%m%d')"
-  if [ "$DIT_RUN_OVERNIGHT" = yes ]; then
-    REC_DAYS="$REC_DAYS $(date -j -v+1d -f '%Y-%m-%d' "$DAY_ISO" '+%y%m%d' 2>/dev/null || date -d "$DAY_ISO + 1 day" '+%y%m%d')"
-  fi
+  DATE_LABEL="$(fmt_day "$DATE_FORMAT")"
   ROOTS=()
   while IFS= read -r r; do [ -n "$r" ] && ROOTS+=("$r"); done <<< "$DIT_RUN_ROOTS"
   if [ "$type" = camera ]; then sub="$(fill "$VIDEO_PATH" "$DIT_RUN_CAM")"; else sub="$(fill "$AUDIO_PATH" "")"; fi
@@ -909,6 +1502,7 @@ cmd_run() {
   local n=${#dests[@]}
   local stamp; stamp="$(date '+%Y%m%d-%H%M%S')"
   local work="$STATE/work-$job-$stamp"
+  WORK="$work"
   mkdir -p "$work"
   PLAN="$STATE/$job.plan"; SIZES="$STATE/$job.sizes"
   rm -f "$SIZES" "$STATE/$job.progress" "$STATE/$job".hash-*
@@ -922,11 +1516,13 @@ cmd_run() {
   local count; count=$(wc -l < "$PLAN" | tr -d ' ')
   if [ "$count" = 0 ]; then
     if [ "$type" = audio ]; then
-      say "RESULT: FAIL - no takes dated ${REC_DAYS// / or } on the audio card. Takes found:"
+      say "RESULT: FAIL - none of the chosen takes were found on the audio card. Takes found:"
       # shellcheck disable=SC2010
       ls "$src" | grep -F "$AUDIO_TAKE_SUFFIX" | head -20
+      record_early "none of the chosen takes were found on the card; nothing copied"
     else
       say "RESULT: FAIL - nothing to copy was found on the card"
+      record_early "nothing to copy was found on the card"
     fi
     exit 1
   fi
@@ -934,7 +1530,30 @@ cmd_run() {
   if [ -n "$dups" ]; then
     say "RESULT: FAIL - these names occur more than once on the card, nothing copied:"
     echo "$dups" | head -20
+    record_early "some names occur more than once on the card; nothing copied"
     exit 1
+  fi
+
+  # Audio: a take already on a destination under names this offload would not give it
+  # (an earlier offload with another RoomTone choice or naming) would end up stored twice.
+  if [ "$type" = audio ]; then
+    local tk f
+    for d in "${dests[@]}"; do
+      while IFS= read -r tk; do
+        [ -d "$d/$tk" ] || continue
+        find "$d/$tk" -maxdepth 1 -type f ! -name '.*' ! -name '*.dit-part' | while IFS= read -r f; do
+          cut -f2 "$PLAN" | grep -qxF "$tk/$(basename "$f")" || echo "$f"
+        done
+      done < <(cut -f2 "$PLAN" | cut -d/ -f1 | sort -u)
+    done > "$work/renamed.txt"
+    if [ -s "$work/renamed.txt" ]; then
+      say "RESULT: FAIL - $job: these takes are already on a destination under other names, nothing copied:"
+      head -20 "$work/renamed.txt"
+      say "  Most likely an earlier offload of the same takes with a different RoomTone choice or naming."
+      say "  So that no take is stored twice under two names, rename or move those files, then start again."
+      record_early "takes already on a destination under other names; nothing copied"
+      exit 1
+    fi
   fi
 
   local kb=0 k s d free
@@ -948,7 +1567,7 @@ cmd_run() {
   [ "$count" -le 60 ] || echo "              ... and $((count - 60)) more"
 
   for d in "${dests[@]}"; do
-    mkdir -p "$d" || { say "RESULT: FAIL - could not create $d"; exit 1; }
+    mkdir -p "$d" || { say "RESULT: FAIL - could not create $d"; record_early "could not create $d"; exit 1; }
   done
 
   # Files already at a destination (an earlier or interrupted run): keep identical ones,
@@ -969,6 +1588,7 @@ cmd_run() {
     head -20 "$work/existing.txt"
     say "  They may be left from an interrupted offload or come from another card."
     say "  Move them aside (dit-offloader never deletes or overwrites), then start again."
+    record_early "files already at a destination differ from the card; nothing copied"
     exit 1
   fi
   [ $same = 0 ] || say "  $same copies are already at a destination and match the card; they are kept"
@@ -989,7 +1609,9 @@ cmd_run() {
     if [ -n "$free" ] && [ "$free" -lt "$want" ]; then
       say "RESULT: FAIL - not enough free space on $m, nothing copied"
       say "  needed: $((want / 1024)) MB (this offload $((mine / 1024)) MB, plus running offloads)   free: $((free / 1024)) MB"
-      rm -f "$STATE/$job.sizes"; unlock_space; exit 1
+      rm -f "$STATE/$job.sizes"; unlock_space
+      record_early "not enough free space on $m; nothing copied"
+      exit 1
     fi
   done < <(cat "$work/space-mine.txt" "$work/space-others.txt" |
            awk -F'\t' '{ n[$1] += $2 } END { for (m in n) print m "\t" n[m] }')
@@ -1018,7 +1640,7 @@ cmd_run() {
     : > "$COPIED"
     i=0
     while [ $i -lt "$n" ]; do
-      hash_following "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" "$STATE/$job.hash-dest$((i + 1))" &
+      hash_following "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" "$STATE/$job.hash-dest$((i + 1))" "$work/dest$((i + 1)).times" &
       pids+=($!)
       i=$((i + 1))
     done
@@ -1026,6 +1648,13 @@ cmd_run() {
     touch "$COPIED.done"
     printf 'step\t2\t%s\n' "$(date +%s)" >> "$STATE/$job.progress"
     say "Copies done; finishing the checksums of the copies"
+    if [ "$SOURCE_RECHECK" = yes ]; then
+      # The card was read once, for all the copies. A second read, compared with the first,
+      # catches a card or reader that returns different data without reporting an error.
+      say "Reading the card a second time to compare (SOURCE_RECHECK)"
+      hash_card "$work/card-second.$HASH_ALGO" "$STATE/$job.hash-recheck" &
+      pids+=($!)
+    fi
     for k in "${pids[@]}"; do wait "$k"; done
   else
     printf 'step\t1\t%s\n' "$started" >> "$STATE/$job.progress"
@@ -1049,7 +1678,7 @@ cmd_run() {
     pids=()
     i=0
     while [ $i -lt "$n" ]; do
-      hash_dest "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" "$STATE/$job.hash-dest$((i + 1))" &
+      hash_dest "${dests[$i]}" "$work/dest$((i + 1)).$HASH_ALGO" "$STATE/$job.hash-dest$((i + 1))" "$work/dest$((i + 1)).times" &
       pids+=($!)
       i=$((i + 1))
     done
@@ -1059,6 +1688,12 @@ cmd_run() {
   local ok=1
   if grep -q '^UNREADABLE' "$work/card.$HASH_ALGO"; then ok=0; say "  some files on the card could not be read"; fi
   if grep -q '^COPYERROR' "$work/card.$HASH_ALGO"; then ok=0; say "  some files could not be copied"; fi
+  if [ -f "$work/card-second.$HASH_ALGO" ] &&
+     ! diff "$work/card.$HASH_ALGO" "$work/card-second.$HASH_ALGO" > "$work/diff-card.txt"; then
+    ok=0
+    say "  the card gave different data when read a second time; the card or its reader may be failing:"
+    head -20 "$work/diff-card.txt"
+  fi
   i=1
   while [ $i -le "$n" ]; do
     if ! diff "$work/card.$HASH_ALGO" "$work/dest$i.$HASH_ALGO" > "$work/diff$i.txt"; then
@@ -1067,24 +1702,28 @@ cmd_run() {
     i=$((i + 1))
   done
 
+  local finished f; finished="$(date +%s)"
   if [ $ok != 1 ]; then
     say "RESULT: FAIL - $job: do NOT erase this card. Details in $work"
+    record_job "$job" FAIL "$src" "$started" "$finished" "$mode" "$work/card.$HASH_ALGO" "${dests[@]}"
     exit 1
   fi
   say "RESULT: PASS - $job: all $count files match on $n destinations."
   say "  checksum list: $work/card.$HASH_ALGO"
-  local finished f; finished="$(date +%s)"
   JOB="$job"
+  i=0
   for d in "${dests[@]}"; do
+    i=$((i + 1))
     case "$CHECKSUM_FILE" in
       none)   continue ;;
       list)   f="$(write_list "$d" "$work/card.$HASH_ALGO" "$stamp")" ;;
-      mhl)    f="$(write_mhl "$d" "$work/card.$HASH_ALGO" "$started" "$finished")" ;;
-      ascmhl) f="$(write_ascmhl "$d" "$work/card.$HASH_ALGO" "$started" "$finished")" ;;
+      mhl)    f="$(write_mhl "$d" "$work/card.$HASH_ALGO" "$started" "$finished" "$work/dest$i.times")" ;;
+      ascmhl) f="$(write_ascmhl "$d" "$work/card.$HASH_ALGO" "$started" "$finished" "$work/dest$i.times")" ;;
     esac
     if [ -n "$f" ]; then say "  checksum file saved: $f"
     else say "  note: could not save the checksum file in $d"; fi
   done
+  record_job "$job" PASS "$src" "$started" "$finished" "$mode" "$work/card.$HASH_ALGO" "${dests[@]}"
   if [ "$AUTO_EJECT" = yes ]; then
     if diskutil eject "$src" >/dev/null 2>&1; then say "Card ejected. Safe to remove."
     else say "Could not eject the card automatically. Run: dit-offloader eject $job"; fi
@@ -1095,6 +1734,29 @@ cmd_run() {
 job_log() {
   # shellcheck disable=SC2012
   ls -t "$STATE/$1"-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9]*.log 2>/dev/null | head -1
+}
+
+# RUNNING, PASSED, FAILED, STOPPED or INTERRUPTED (ended without a result).
+job_state() {
+  local log last
+  if job_alive "$1"; then echo RUNNING; return; fi
+  log="$(job_log "$1")"
+  last="$([ -n "$log" ] && grep "RESULT:" "$log" | tail -1)"
+  case "$last" in
+    *"RESULT: PASS"*) echo PASSED ;;
+    *"RESULT: FAIL"*) echo FAILED ;;
+    *"RESULT: STOPPED"*) echo STOPPED ;;
+    *) echo INTERRUPTED ;;
+  esac
+}
+
+paint() {            # state, text: the text in the state's colour, when colour is on
+  [ "$COLOR" = yes ] || { printf '%s' "$2"; return; }
+  case "$1" in
+    PASSED) printf '\033[32m%s\033[0m' "$2" ;;
+    RUNNING) printf '\033[33m%s\033[0m' "$2" ;;
+    *) printf '\033[1;31m%s\033[0m' "$2" ;;
+  esac
 }
 
 running_jobs() {
@@ -1219,14 +1881,98 @@ show_parallel() {    # job, progress file, now, step, KB in all, number of desti
   done
 }
 
+# ---------- alerts in Terminal (TERMINAL_ALERTS) while watching or waiting ----------
+
+ALERT_SEEN=""        # jobs seen running while watching
+ALERT_PREV=""        # "job:state" pairs from the last look
+
+alert_wants() { case " $TERMINAL_ALERTS " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# Look at every job: note those that just finished (ALERT_NEWS), ring the bell, and put the
+# counts in the window title.
+alerts_tick() {
+  local p job st prev running=0 passed=0 notpassed=0 rings=0 pairs="" i
+  ALERT_NEWS=""
+  for p in "$STATE"/*.pid; do
+    [ -f "$p" ] || continue
+    job="$(basename "$p" .pid)"; st="$(job_state "$job")"
+    prev="$(printf '%s\n' "$ALERT_PREV" | tr ' ' '\n' | sed -n "s/^$job://p")"
+    pairs="$pairs $job:$st"
+    if [ "$st" = RUNNING ]; then
+      case " $ALERT_SEEN " in *" $job "*) ;; *) ALERT_SEEN="$ALERT_SEEN $job" ;; esac
+    fi
+    case " $ALERT_SEEN " in *" $job "*) ;; *) continue ;; esac
+    case "$st" in RUNNING) running=$((running + 1)) ;; PASSED) passed=$((passed + 1)) ;; *) notpassed=$((notpassed + 1)) ;; esac
+    if [ "$prev" = RUNNING ] && [ "$st" != RUNNING ]; then
+      ALERT_NEWS="$ALERT_NEWS$(date '+%H:%M:%S')  $(paint "$st" "$job $st")"$'\n'
+      if [ "$st" = PASSED ]; then [ $rings -ge 1 ] || rings=1; else rings=3; fi
+    fi
+  done
+  ALERT_PREV="$pairs"
+  [ -t 1 ] || return 0
+  if alert_wants title; then
+    printf '\033]0;dit-offloader: %d running, %d passed, %d not passed\007' $running $passed $notpassed
+  fi
+  if alert_wants bell; then
+    i=0
+    while [ $i -lt $rings ]; do printf '\a'; sleep 0.4; i=$((i + 1)); done
+  fi
+}
+
+# One line on how the watched offloads ended. Returns 1 if any did not pass.
+alert_summary() {
+  local job st n=0 passed="" bad=""
+  for job in $ALERT_SEEN; do
+    n=$((n + 1)); st="$(job_state "$job")"
+    if [ "$st" = PASSED ]; then passed="$passed $job"; else bad="$bad $job ($st)"; fi
+  done
+  if [ $n = 0 ]; then echo "No offloads were running."; return 0; fi
+  if [ -z "$bad" ]; then
+    paint PASSED "ALL $n PASSED:$passed"; echo
+    return 0
+  fi
+  paint FAILED "NOT PASSED:$bad"; echo "${passed:+   passed:$passed}"
+  return 1
+}
+
+alerts_setup() {
+  [ "$CONFIG_LOADED" = yes ] || [ ! -f "$CONFIG" ] || load_config
+  COLOR=no
+  [ -n "$NO_COLOR" ] || [ ! -t 1 ] || COLOR=yes
+  ALERT_SEEN=""; ALERT_PREV=""
+}
+
+# "wait": until every running offload has finished, then the summary. Exit status 0 when
+# all of them passed.
+cmd_wait() {
+  alerts_setup
+  alerts_tick
+  if [ -z "$ALERT_SEEN" ]; then echo "No offloads are running."; return 0; fi
+  echo "Waiting for:$ALERT_SEEN   (Ctrl-C stops waiting; the offloads keep running)"
+  while [ "$(running_jobs)" -gt 0 ]; do
+    sleep 2
+    alerts_tick
+    printf '%s' "$ALERT_NEWS"
+  done
+  alerts_tick
+  printf '%s' "$ALERT_NEWS"
+  alert_summary
+}
+
 # "status --watch": redraws the status in place every 2 seconds, like a download
 # progress bar, so earlier screens do not pile up in the terminal's scrollback.
 watch_status() {
   local screen line rows n drawn=0 shown
+  alerts_setup
+  alerts_tick
   if [ ! -t 1 ]; then          # not a terminal: print a fresh status every 2 seconds
     while :; do
-      cmd_status "$@"; [ "$(running_jobs)" -gt 0 ] || return 0; sleep 2
+      cmd_status "$@"; alerts_tick
+      [ "$(running_jobs)" -gt 0 ] || break
+      sleep 2
     done
+    if alert_wants summary; then echo; alert_summary; fi
+    return 0
   fi
   # Hide the cursor and clip long lines instead of wrapping them while watching.
   printf '\033[?25l\033[?7l'
@@ -1255,7 +2001,11 @@ watch_status() {
     done <<< "$screen"
     printf '\033[J'
     drawn=$shown
-    [ "$(running_jobs)" -gt 0 ] || return 0
+    alerts_tick
+    if [ "$(running_jobs)" = 0 ]; then
+      if alert_wants summary; then echo; alert_summary; fi
+      return 0
+    fi
     sleep 2
   done
 }
@@ -1278,18 +2028,24 @@ cmd_status() {
   fi
   BAR_WIDTH=24; BAR_ON="#"; BAR_OFF="."
   case "${LC_ALL:-${LC_CTYPE:-$LANG}}" in *UTF-8*|*utf8*|*UTF8*) BAR_ON="█"; BAR_OFF="░" ;; esac
+  COLOR=no
+  if [ -z "$NO_COLOR" ] && { [ -t 1 ] || [ "$WATCHING" = yes ]; }; then COLOR=yes; fi
   OFFSETS="$(read_offsets)"
+  local passed=0 running=0 notpassed=0 bad="" sep="·"
+  case "${LC_ALL:-${LC_CTYPE:-$LANG}}" in *UTF-8*|*utf8*|*UTF8*) ;; *) sep="-" ;; esac
   for p in "$STATE"/*.pid; do
     [ -f "$p" ] || continue
     if [ "$all" = no ] && [ -z "$(find "$p" -mmin -1440 2>/dev/null)" ]; then continue; fi
     found=1
     job="$(basename "$p" .pid)"
     log="$(job_log "$job")"
-    if job_alive "$job"; then state="RUNNING"
-    elif [ -n "$log" ] && grep -q "RESULT: STOPPED" "$log"; then state="STOPPED"
-    elif [ -n "$log" ] && grep -q "RESULT:" "$log"; then state="finished"
-    else state="INTERRUPTED"; fi
-    echo "===== $job: $state ====="
+    state="$(job_state "$job")"
+    case "$state" in
+      PASSED) passed=$((passed + 1)) ;;
+      RUNNING) running=$((running + 1)) ;;
+      *) bad="$bad $job ($state)"; notpassed=$((notpassed + 1)) ;;
+    esac
+    paint "$state" "===== $job: $state ====="; echo
     if [ "$state" = RUNNING ]; then
       show_progress "$job"
       [ "$WATCHING" = yes ] || { [ -n "$log" ] && grep -v '^              ' "$log" | tail -3; }
@@ -1302,7 +2058,14 @@ cmd_status() {
       echo "RESULT: INTERRUPTED - $job stopped before it finished. Do NOT erase this card; start it again."
     echo
   done
-  [ $found = 1 ] || echo "No offloads in the last 24 hours. (Older ones: dit-offloader status --all)"
+  if [ $found = 1 ]; then
+    local line="Summary: $passed passed"
+    [ -z "$bad" ] || line="$line $sep $(paint FAILED "$notpassed NOT passed:$bad")"
+    [ $running = 0 ] || line="$line $sep $running running"
+    echo "$line"
+  else
+    echo "No offloads in the last 24 hours. (Older ones: dit-offloader status --all)"
+  fi
 }
 
 cmd_eject() {
@@ -1391,12 +2154,16 @@ cmd_stop() {
 # Clear finished offloads from "status". Their records move to $STATE/archive/<time>/,
 # so nothing is lost; the checksum files on the destinations are not touched.
 cmd_clear() {
-  local all=no p job log result moved=0 kept="" busy="" box f
-  case "$1" in
-    "") ;;
-    --all) all=yes ;;
-    *) die "usage: dit-offloader clear [--all]" ;;
-  esac
+  local all=no purge="" p job log result moved=0 kept="" busy="" box f old
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) all=yes; shift ;;
+      --purge)
+        case "$2" in ""|*[!0-9]*) die "--purge needs a number of days, e.g. --purge 30" ;; esac
+        purge="$2"; shift 2 ;;
+      *) die "usage: dit-offloader clear [--all] [--purge DAYS]" ;;
+    esac
+  done
   box="$STATE/archive/$(date '+%Y%m%d-%H%M%S')"
   for p in "$STATE"/*.pid; do
     [ -f "$p" ] || continue
@@ -1418,6 +2185,37 @@ cmd_clear() {
   [ -z "$kept" ] || echo "Not passed, kept so they stay visible:$kept   (dit-offloader clear --all clears them too)"
   if [ $moved -gt 0 ]; then echo "Records kept in $box"
   elif [ -z "$busy$kept" ]; then echo "Nothing to clear."; fi
+  if [ -n "$purge" ] && [ -d "$STATE/archive" ]; then
+    # Records cleared more than $purge days ago. The checksum files and reports on the
+    # destinations are not touched.
+    old="$(find "$STATE/archive" -mindepth 1 -maxdepth 1 -type d -mtime +"$purge" | wc -l | tr -d ' ')"
+    find "$STATE/archive" -mindepth 1 -maxdepth 1 -type d -mtime +"$purge" -exec rm -rf {} +
+    echo "Deleted $old archived record set(s) older than $purge days."
+  fi
+}
+
+# "report": the offload report of a project and day, in Terminal.
+cmd_report() {
+  load_config
+  local project="" fmt=text dir
+  DAY_ISO=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --day)  [ -n "$2" ] || die "--day needs a date"; DAY_ISO="$2"; shift 2 ;;
+      --html) fmt=html; shift ;;
+      -*) die "usage: dit-offloader report [project] [--day YYYY-MM-DD] [--html]" ;;
+      *) project="$1"; shift ;;
+    esac
+  done
+  PROJECT="${project:-$PROJECT}"
+  [ -n "$PROJECT" ] || die "no project name. Use: dit-offloader report <project>"
+  if [ -z "$DAY_ISO" ]; then
+    if [ "$SHOOT_DAY" = cutoff ]; then DAY_ISO="$(cutoff_day)"; else DAY_ISO="$(date '+%Y-%m-%d')"; fi
+  fi
+  DATE_LABEL="$(fmt_day "$DATE_FORMAT")" || die "could not understand the day \"$DAY_ISO\" (use YYYY-MM-DD)"
+  dir="$STATE/reports/$PROJECT/$DAY_ISO"
+  [ -n "$(report_recs "$dir" 2>/dev/null)" ] || { echo "No offloads recorded for $PROJECT on $DAY_ISO."; return 0; }
+  "report_$fmt" "$dir" "$PROJECT" "$DATE_LABEL"
 }
 
 make_fake_card() {
@@ -1474,7 +2272,8 @@ cmd_rehearse() {
   done
   echo "index" > "$cam/OTHER/INDEX.BIN"
   echo "Fake camera card created: FAKECAM (clips named Z...)"
-  ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --no-watch --card FAKECAM ) || exit 1
+  # Always today: the fake cards are made today, whatever SHOOT_DAY says.
+  ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --no-watch --day "$(date '+%Y-%m-%d')" --card FAKECAM ) || exit 1
 
   if [ "$AUDIO_ENABLED" = yes ]; then
     make_fake_card FAKEAUDIO
@@ -1485,7 +2284,7 @@ cmd_rehearse() {
     done
     mkdir -p "$aud/250101_001$AUDIO_TAKE_SUFFIX"; echo old > "$aud/250101_001$AUDIO_TAKE_SUFFIX/250101_001_Tr1.WAV"
     echo "Fake audio card created: FAKEAUDIO (3 takes today, 1 old take)"
-    ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --no-watch --card FAKEAUDIO ) || exit 1
+    ( cmd_start "$TEST_PROJECT" "${args[@]}" "${flags[@]}" --no-watch --day "$(date '+%Y-%m-%d')" --card FAKEAUDIO ) || exit 1
   fi
 
   wait_for_jobs 90
@@ -1510,7 +2309,9 @@ case "$1" in
   _run)       cmd_run "$2" "$3" "$4" ;;
   status)     shift; cmd_status "$@" ;;
   eject)      cmd_eject "$2" ;;
-  clear)      cmd_clear "$2" ;;
+  clear)      shift; cmd_clear "$@" ;;
+  wait)       cmd_wait ;;
+  report)     shift; cmd_report "$@" ;;
   stop)       cmd_stop "$2" ;;
   rehearse)   shift; cmd_rehearse "$@" ;;
   --version|-v|version) echo "dit-offloader $VERSION" ;;
